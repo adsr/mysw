@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -74,9 +75,9 @@ struct _fdh_t {
 
 struct _proxy_t {
     int epfd;
-    int sockfd;
     worker_t *workers;
     pool_t *pool_map;
+    pthread_t signal_thread;
     int done;
     fdh_t fdh_listen;
 };

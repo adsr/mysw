@@ -96,6 +96,7 @@ static int client_process_connected(client_t *client) {
             | MYSQLD_CLIENT_CONNECT_WITH_DB \
             | MYSQLD_CLIENT_PROTOCOL_41;
 
+
         /* Build init packet */
         /* TODO support other caps, auth, ssl */
         out = &fdh_conn->out;
@@ -107,12 +108,12 @@ static int client_process_connected(client_t *client) {
         buf_append_str_len(out, "\x00\x00\x00\x00", 4);         /* TODO connection id */
         buf_append_str_len(out, challenge, 8);                  /* challenge[:8] */
         buf_append_u8(out, '\x00');                             /* filler */
-        buf_append_u16(out, capability_flags & 0xffff);         /* cap flags lower */
+        buf_append_u16(out, capability_flags & 0xffff);         /* cap flags lower 2 */
         buf_append_u8(out, '\x21');                             /* TODO character set */
-        buf_append_u16(out, 0x0200);                            /* TODO status flags */
-        buf_append_u16(out, (capability_flags >> 2) & 0xffff);  /* cap flags upper */
+        buf_append_u16(out, 0x0002);                            /* TODO status flags */
+        buf_append_u16(out, (capability_flags >> 16) & 0xffff); /* cap flags upper 2 */
         buf_append_u8(out, 21);                                 /* len(challenge) */
-        buf_append_str_len(out, "\x00\x00\x00\x00\x00\x00\x00\x00*x00\x00", 10);
+        buf_append_str_len(out, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 10);
         buf_append_str_len(out, challenge + 8, 13);             /* challenge[8:] */
         buf_append_str_len(out, "mysql_native_password\x00", 22);
         buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
@@ -134,6 +135,8 @@ static int client_process_handshake_received_init(client_t *client) {
     int max_packet_size;
     int server_status_flags;
     int charset;
+    uint8_t sequence_id;
+    int payload_len;
     char *username, *auth, *dbname, *plugin;
     size_t username_len, auth_len, dbname_len, plugin_len;
 
@@ -144,6 +147,8 @@ static int client_process_handshake_received_init(client_t *client) {
 
     /* https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html */
     cur = 0;
+    payload_len = buf_get_u24(in, cur);                 cur += 3;
+    sequence_id = buf_get_u8(in, cur);                  cur += 1;
     capability_flags = buf_get_u32(in, cur);            cur += 4;
     max_packet_size = buf_get_u32(in, cur);             cur += 4;
     charset = buf_get_u8(in, cur);                      cur += 1;
@@ -177,12 +182,13 @@ static int client_process_handshake_received_init(client_t *client) {
     (void)plugin;
     (void)charset;
     (void)max_packet_size;
+    (void)payload_len;
 
     out = &client->fdh_conn.out;
     server_status_flags = MYSQLD_SERVER_STATUS_AUTOCOMMIT; /* TODO hmm */
     buf_clear(out);
     buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
-    buf_append_u8(out, '\x00');                             /* sequence id (1) */
+    buf_append_u8(out, sequence_id+1);                      /* sequence id (1) */
     buf_append_u8(out, '\x00');                             /* OK packet header */
     buf_append_u8(out, '\x00');                             /* affected rows (lenenc) */
     buf_append_u8(out, '\x00');                             /* last insert id (lenenc) */
@@ -221,16 +227,19 @@ static int client_process_command_ready(client_t *client) {
         case MYSQLD_COM_QUERY:
         case MYSQLD_COM_STMT_PREPARE:
             /* TODO parse out USE statement, retarget, forward */
+            /* TODO prevent retarget in transaction */
             sql = buf_get_streof(in, 5, &sql_len);
+            printf("sql='%.*s'\n", (int)sql_len, sql);
+            break;
         case MYSQLD_COM_INIT_DB:
             /* TODO retarget, forward */
+            break;
+        case MYSQLD_COM_QUIT:
+            /* TODO quit */
             break;
         /* TODO? case COM_CHANGE_USER */
         /* TODO? case COM_RESET_CONNECTION */
         /* TODO? case COM_SET_OPTION */
-        case MYSQLD_COM_QUIT:
-            /* TODO quit */
-            break;
         default:
             /* TODO if we have a target, forward. if not, err */
             break;
@@ -272,7 +281,7 @@ static int client_process_command_ready(client_t *client) {
     (void)sql;
 
     /* TODO some commands expect a response, others do not */
-    /*      set poll flags depending on that */
+    /*      set epoll_flags depending on that */
 
     /*
     timeline:
@@ -300,10 +309,12 @@ static int client_process_command_awaiting_response(client_t *client) {
 }
 
 static int client_destroy(client_t *client) {
+    client->fdh_conn.epoll_flags = 0;
+    client->fdh_event.epoll_flags = 0;
     close(client->fdh_conn.fd);
+    close(client->fdh_event.fd);
     buf_free(&client->fdh_conn.in);
     buf_free(&client->fdh_conn.out);
-    close(client->fdh_event.fd);
     /* TODO eh */
     free(client);
     return 0;

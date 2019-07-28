@@ -1,40 +1,47 @@
 #include "mysw.h"
 
-int fdh_watch(fdh_t *fdh) {
-    int rv;
+static int fdh_watch_inner(fdh_t *fdh, int rewatch) {
+    int rv, epoll_op;
     struct epoll_event ev;
 
     /* Init epoll_event */
     memset(&ev, 0, sizeof(ev));
-    #ifdef EPOLLEXCLUSIVE
+    #if 0 && defined(EPOLLEXCLUSIVE)
         ev.events = EPOLLET | EPOLLEXCLUSIVE | fdh->epoll_flags;
     #else
         ev.events = EPOLLET | EPOLLONESHOT | fdh->epoll_flags;
     #endif
     ev.data.ptr = fdh;
 
+    epoll_op = rewatch ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+
     /* Add to epoll */
-    if ((rv = epoll_ctl(fdh->proxy->epfd, EPOLL_CTL_ADD, fdh->fd, &ev)) < 0) {
-        perror("fdh_watch: epoll_ctl");
+    if ((rv = epoll_ctl(fdh->proxy->epfd, epoll_op, fdh->fd, &ev)) < 0) {
+        perror("fdh_watch_inner: epoll_ctl");
     }
 
     return rv;
 }
 
+int fdh_watch(fdh_t *fdh) {
+    return fdh_watch_inner(fdh, 0);
+}
+
 int fdh_rewatch(fdh_t *fdh) {
-    #ifdef EPOLLEXCLUSIVE
+    #if 0 && defined(EPOLLEXCLUSIVE)
         (void)fdh;
         return 0;
     #else
-        return fdh_watch(fdh);
+        return fdh_watch_inner(fdh, 1);
     #endif
 }
 
 int fdh_unwatch(fdh_t *fdh) {
-    #ifdef EPOLLEXCLUSIVE
+    #if 0 && defined(EPOLLEXCLUSIVE)
         struct epoll_event ev;
         return epoll_ctl(fdh->proxy->epfd, EPOLL_CTL_DEL, fdh->fd, &ev);
     #else
+        (void)fdh; /* TODO EPOLL_CTL_DEL needed? */
         return 0;
     #endif
 }
@@ -81,7 +88,7 @@ int fdh_write(fdh_t *fdh) {
 }
 
 int fdh_is_write_finished(fdh_t *fdh) {
-    if (fdh->out_cur >= fdh->out.len) {
+    if (fdh_is_writing(fdh) && fdh->out_cur >= fdh->out.len) {
         return 1;
     }
     return 0;
@@ -112,8 +119,8 @@ int fdh_read(fdh_t *fdh) {
     in = &fdh->in;
 
     len = in->len;
-    buf = in->data + len;
     buf_ensure_cap(in, len + opt_read_size + 1);
+    buf = in->data + len;
 
     rv = read(fdh->fd, buf, opt_read_size);
     if (rv == -1) {

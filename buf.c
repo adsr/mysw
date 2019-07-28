@@ -77,19 +77,22 @@ int buf_get_void(buf_t *buf, size_t pos, void *dest, size_t len) {
 uint8_t buf_get_u8(buf_t *buf, size_t pos) {
     uint8_t i;
     i = 0;
-    return buf_get_void(buf, pos, &i, sizeof(i));
+    buf_get_void(buf, pos, &i, sizeof(i));
+    return i;
 }
 
 uint32_t buf_get_u24(buf_t *buf, size_t pos) {
     uint32_t i;
     i = 0;
-    return buf_get_void(buf, pos, &i, 3);
+    buf_get_void(buf, pos, &i, 3);
+    return i;
 }
 
 uint32_t buf_get_u32(buf_t *buf, size_t pos) {
     uint32_t i;
     i = 0;
-    return buf_get_void(buf, pos, &i, sizeof(i));
+    buf_get_void(buf, pos, &i, sizeof(i));
+    return i;
 }
 
 int buf_len(buf_t *buf) {

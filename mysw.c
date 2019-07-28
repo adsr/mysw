@@ -3,10 +3,16 @@
 char* opt_addr = NULL;
 int opt_port = 3306;
 int opt_backlog = 16;
-int opt_num_threads = 16;
+int opt_num_threads = 1; /* TODO saner default */
 int opt_epoll_max_events = 256;
 int opt_epoll_timeout_ms = 1000;
 int opt_read_size = 256;
+
+static void *signal_main(void *arg);
+static void signal_handle(int signum);
+static int signal_block_all();
+
+static int done_pipe[2];
 
 int main(int argc, char **argv) {
     int i, exit_code;
@@ -37,6 +43,10 @@ int main(int argc, char **argv) {
         perror("epoll_create");
         goto main_error;
     }
+
+    /* Create thread for signal handling */
+    pthread_create(&proxy->signal_thread, NULL, signal_main, proxy);
+    signal_block_all();
 
     /* Create worker threads */
     /* TODO signal handling thread */
@@ -93,4 +103,57 @@ main_done:
     free(proxy);
 
     return exit_code;
+}
+
+static void *signal_main(void *arg) {
+    int rv;
+    int signum;
+    fd_set rfds;
+    struct timeval tv;
+    struct sigaction sa;
+    proxy_t *proxy;
+
+    proxy = (proxy_t *)arg;
+
+    /* Create done_pipe */
+    rv = pipe(done_pipe);
+    fcntl(done_pipe[1], F_SETFL, O_NONBLOCK);
+
+    /* Install signal handler */
+    memset(&sa, 0, sizeof(struct sigaction));
+    sa.sa_handler = signal_handle;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+
+    /* Wait for write on done_pipe from signal_handle */
+    do {
+        FD_ZERO(&rfds);
+        FD_SET(done_pipe[0], &rfds);
+        tv.tv_sec = 60;
+        tv.tv_usec = 0;
+        rv = select(done_pipe[0] + 1, &rfds, NULL, NULL, &tv);
+    } while (rv < 1);
+
+    /* Read pipe for fun */
+    rv = read(done_pipe[0], &signum, sizeof(int));
+
+    /* Set done flag */
+    proxy->done = 1;
+    /* TODO broadcast all conditions */
+
+    return NULL;
+}
+
+static void signal_handle(int signum) {
+    write(done_pipe[1], &signum, sizeof(int));
+}
+
+static int signal_block_all() {
+    sigset_t set;
+    sigfillset(&set);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+    return 0;
 }

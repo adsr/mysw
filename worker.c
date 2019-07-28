@@ -31,7 +31,7 @@ static int worker_accept_conn(worker_t *worker) {
     int connfd, sock_flags;
 
     /* Accept client conn */
-    if ((connfd = accept(worker->proxy->sockfd, NULL, NULL)) < 0) {
+    if ((connfd = accept(worker->proxy->fdh_listen.fd, NULL, NULL)) < 0) {
         perror("worker_accept_conn: accept");
         return 1;
     }
