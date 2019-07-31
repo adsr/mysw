@@ -5,63 +5,74 @@ static int client_process_connected(client_t *client);
 static int client_process_handshake_received_init(client_t *client);
 static int client_process_handshake_sent_response(client_t *client);
 static int client_process_command_ready(client_t *client);
-static int client_process_command_awaiting_response(client_t *client);
-static int client_destroy(client_t *client);
 
-int client_new(worker_t *worker, int connfd, client_t **out_client) {
+int client_new(proxy_t *proxy, int connfd, client_t **out_client) {
     client_t *client;
+    int efd;
+
+    if ((efd = eventfd(0, EFD_NONBLOCK)) < 0) {
+        return MYSW_ERR;
+    }
+
     client = calloc(1, sizeof(client_t));
 
-    client->fdh_conn.proxy = worker->proxy;
+    /* Socket events (client socket is readable or writeable) */
+    client->fdh_conn.proxy = proxy;
     client->fdh_conn.type = FDH_TYPE_CLIENT;
     client->fdh_conn.u.client = client;
+    client->fdh_conn.fn_read_write = fdh_read_write;
+    client->fdh_conn.fn_process = client_process;
+    client->fdh_conn.fn_destroy = client_destroy;
     client->fdh_conn.fd = connfd;
-    client->fdh_conn.epoll_flags = EPOLLOUT;
+    client->fdh_conn.epoll_flags = EPOLLOUT; /* Initially poll for writeable client */
 
-    client->fdh_event.proxy = worker->proxy;
+    /* Application events (e.g., to deliver results to a client) */
+    client->fdh_event.proxy = proxy;
     client->fdh_event.type = FDH_TYPE_CLIENT;
     client->fdh_event.u.client = client;
+    client->fdh_event.fn_read_write = NULL;
+    client->fdh_event.fn_process = client_process;
+    client->fdh_event.fn_destroy = client_destroy;
     client->fdh_event.fd = eventfd(0, EFD_NONBLOCK);
     client->fdh_event.epoll_flags = EPOLLIN;
 
     client->state = CLIENT_STATE_CONNECTED;
 
-    fdh_watch(&client->fdh_conn);
-
     if (out_client) *out_client = client;
 
-    return client_process(client);
+    return MYSW_OK;
 }
 
-int client_process(client_t *client) {
-    if (client->fdh_conn.eof) {
-        /* TODO client disconnected */
-        client_destroy(client);
-    } else if (client->fdh_conn.last_errno) {
-        /* TODO there was a read/write error */
-        client_destroy(client);
+int client_process(fdh_t *fdh) {
+    int rv;
+    client_t *client;
+
+    client = fdh->u.client;
+    if (client->fdh_conn.read_eof || client->fdh_conn.read_write_errno) {
+        /* The client disconnected or there was a read/write error */
+        fdh->destroy = 1;
+        return MYSW_OK;
     }
+
     switch (client->state) {
         case CLIENT_STATE_CONNECTED:
-            client_process_connected(client);
+            rv = client_process_connected(client);
             break;
         case CLIENT_STATE_HANDSHAKE_RECEIVED_INIT:
-            client_process_handshake_received_init(client);
+            rv = client_process_handshake_received_init(client);
             break;
         case CLIENT_STATE_HANDSHAKE_SENT_RESPONSE:
-            client_process_handshake_sent_response(client);
+            rv = client_process_handshake_sent_response(client);
             break;
         case CLIENT_STATE_COMMAND_READY:
-            client_process_command_ready(client);
-            break;
-        case CLIENT_STATE_COMMAND_AWAITING_RESPONSE:
-            client_process_command_awaiting_response(client);
+            rv = client_process_command_ready(client);
             break;
         default:
             fprintf(stderr, "client_process: Invalid client state %d\n", client->state);
+            rv = MYSW_ERR;
             break;
     }
-    return 0;
+    return rv;
 }
 
 /**
@@ -69,8 +80,9 @@ int client_process(client_t *client) {
  * https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
  */
 static int client_process_connected(client_t *client) {
-    int capability_flags, i;
-    char challenge[21];
+    uint32_t capability_flags;
+    int i;
+    uchar challenge[21];
     buf_t *out;
     fdh_t *fdh_conn;
 
@@ -87,7 +99,7 @@ static int client_process_connected(client_t *client) {
         /* Send handshake packet */
 
         /* Init challenge */
-        for (i = 0; i < 20; ++i) challenge[i] = rand();
+        for (i = 0; i < 20; ++i) challenge[i] = (uchar)rand();
         challenge[20] = '\x00';
 
         /* Init caps */
@@ -95,7 +107,6 @@ static int client_process_connected(client_t *client) {
             | MYSQLD_CLIENT_SECURE_CONNECTION \
             | MYSQLD_CLIENT_CONNECT_WITH_DB \
             | MYSQLD_CLIENT_PROTOCOL_41;
-
 
         /* Build init packet */
         /* TODO support other caps, auth, ssl */
@@ -106,21 +117,21 @@ static int client_process_connected(client_t *client) {
         buf_append_u8(out, '\x0a');                             /* protocol version */
         buf_append_str_len(out, "derp\x00", 5);                 /* TODO server version */
         buf_append_str_len(out, "\x00\x00\x00\x00", 4);         /* TODO connection id */
-        buf_append_str_len(out, challenge, 8);                  /* challenge[:8] */
+        buf_append_str_len(out, (char *)challenge, 8);          /* challenge[:8] */
         buf_append_u8(out, '\x00');                             /* filler */
         buf_append_u16(out, capability_flags & 0xffff);         /* cap flags lower 2 */
         buf_append_u8(out, '\x21');                             /* TODO character set */
         buf_append_u16(out, 0x0002);                            /* TODO status flags */
         buf_append_u16(out, (capability_flags >> 16) & 0xffff); /* cap flags upper 2 */
         buf_append_u8(out, 21);                                 /* len(challenge) */
-        buf_append_str_len(out, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 10);
-        buf_append_str_len(out, challenge + 8, 13);             /* challenge[8:] */
+        buf_append_u8_repeat(out, '\x00', 10);                  /* filler */
+        buf_append_str_len(out, (char *)(challenge + 8), 13);   /* challenge[8:] */
         buf_append_str_len(out, "mysql_native_password\x00", 22);
         buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
 
         client->fdh_conn.epoll_flags = EPOLLOUT; /* poll for writeable client */
     }
-    return 0;
+    return MYSW_OK;
 }
 
 /**
@@ -142,7 +153,7 @@ static int client_process_handshake_received_init(client_t *client) {
 
     in = &client->fdh_conn.in;
     if (!util_has_complete_mysql_packet(&client->fdh_conn.in)) {
-        return 0;
+        return MYSW_OK;
     }
 
     /* https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html */
@@ -158,9 +169,8 @@ static int client_process_handshake_received_init(client_t *client) {
         auth_len = buf_get_u8(in, cur);                 cur += 1;
         auth = buf_get_str(in, cur);                    cur += auth_len;
     } else {
-        auth_len = buf_get_u8(in, cur);                 cur += 1;
-        auth_len = buf_get_u8(in, cur);                 cur += 1;
-        auth = buf_get_str(in, cur);                    cur += auth_len;
+        /* TODO not clear what to expect here */
+        auth = buf_get_str0(in, cur, &auth_len);        cur += auth_len;
     }
     if (capability_flags & MYSQLD_CLIENT_CONNECT_WITH_DB) {
         dbname = buf_get_str0(in, cur, &dbname_len);    cur += dbname_len + 1;
@@ -172,7 +182,7 @@ static int client_process_handshake_received_init(client_t *client) {
 
     if (strncmp(plugin, "mysql_native_password", plugin_len) != 0) {
         /* TODO error */
-        return 1;
+        return MYSW_ERR;
     }
 
     /* TODO actually auth */
@@ -198,7 +208,7 @@ static int client_process_handshake_received_init(client_t *client) {
 
     client->state = CLIENT_STATE_HANDSHAKE_SENT_RESPONSE;
     client->fdh_conn.epoll_flags = EPOLLOUT; /* poll for writeable client */
-    return 0;
+    return MYSW_OK;
 }
 
 static int client_process_handshake_sent_response(client_t *client) {
@@ -207,7 +217,7 @@ static int client_process_handshake_sent_response(client_t *client) {
         client->state = CLIENT_STATE_COMMAND_READY;
         client->fdh_conn.epoll_flags = EPOLLIN; /* poll for readable client */
     }
-    return 0;
+    return MYSW_OK;
 }
 
 static int client_process_command_ready(client_t *client) {
@@ -217,8 +227,8 @@ static int client_process_command_ready(client_t *client) {
     size_t sql_len;
 
     in = &client->fdh_conn.in;
-    if (!util_has_complete_mysql_packet(&client->fdh_conn.in)) {
-        return 0;
+    if (!util_has_complete_mysql_packet(in)) {
+        return MYSW_OK;
     }
 
     command_byte = buf_get_u8(in, 4);
@@ -299,16 +309,12 @@ static int client_process_command_ready(client_t *client) {
     - server writes response to client queue
     */
 
-    return 0;
+    return MYSW_OK;
 }
 
-static int client_process_command_awaiting_response(client_t *client) {
-    /* TODO await response */
-    (void)client;
-    return 0;
-}
-
-static int client_destroy(client_t *client) {
+int client_destroy(fdh_t *fdh) {
+    client_t *client;
+    client = fdh->u.client;
     client->fdh_conn.epoll_flags = 0;
     client->fdh_event.epoll_flags = 0;
     close(client->fdh_conn.fd);
@@ -317,7 +323,7 @@ static int client_destroy(client_t *client) {
     buf_free(&client->fdh_conn.out);
     /* TODO eh */
     free(client);
-    return 0;
+    return MYSW_OK;
 }
 
 /*

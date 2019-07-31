@@ -2,7 +2,7 @@ prefix?=/usr/local
 
 mysw_cflags:=-std=c90 -Wall -Wextra -pedantic -fstack-protector-all -g -O0 -D_GNU_SOURCE -I. $(CFLAGS)
 mysw_ldflags:=$(LDFLAGS)
-mysw_ldlibs:=-lm -lpthread $(LDLIBS)
+mysw_ldlibs:=-lm -lpthread -lcrypto $(LDLIBS)
 mysw_objects:=$(patsubst %.c,%.o,$(wildcard *.c))
 
 all: mysw

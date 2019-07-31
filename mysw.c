@@ -1,7 +1,7 @@
 #include "mysw.h"
 
 char* opt_addr = NULL;
-int opt_port = 3306;
+int opt_port = 3307;
 int opt_backlog = 16;
 int opt_num_threads = 1; /* TODO saner default */
 int opt_epoll_max_events = 256;
@@ -18,6 +18,7 @@ int main(int argc, char **argv) {
     int i, exit_code;
     struct sockaddr_in addr;
     proxy_t *proxy;
+    server_t *server;
 
     (void)argc;
     (void)argv;
@@ -31,8 +32,10 @@ int main(int argc, char **argv) {
     proxy = calloc(1, sizeof(proxy_t));
     proxy->fdh_listen.proxy = proxy;
     proxy->fdh_listen.type = FDH_TYPE_PROXY;
-    proxy->fdh_listen.skip_read_write = 1; /* Do not read/write on listen socket */
     proxy->fdh_listen.u.proxy = proxy;
+    proxy->fdh_listen.fn_read_write = NULL;
+    proxy->fdh_listen.fn_process = worker_accept_conn;
+    proxy->fdh_listen.fn_destroy = NULL;
     proxy->fdh_listen.fd = -1;
     proxy->fdh_listen.epoll_flags = EPOLLIN;
     proxy->epfd = -1;
@@ -44,12 +47,17 @@ int main(int argc, char **argv) {
         goto main_error;
     }
 
-    /* Create thread for signal handling */
+    /* Create signal handling thread */
     pthread_create(&proxy->signal_thread, NULL, signal_main, proxy);
     signal_block_all();
 
+    /* Connect to local mysqld */
+    /* TODO let user-script do this */
+    /* TODO server pools */
+    server_new(proxy, "127.0.0.1", 3306, &server);
+    server_connect(server);
+
     /* Create worker threads */
-    /* TODO signal handling thread */
     for (i = 0; i < opt_num_threads; ++i) {
         worker_init(&proxy->workers[i], proxy);
         if (worker_spawn(&proxy->workers[i]) != 0) {

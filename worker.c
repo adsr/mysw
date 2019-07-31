@@ -1,12 +1,11 @@
 #include "mysw.h"
 
-static int worker_accept_conn(worker_t *worker);
 static void *worker_main(void *arg);
 
 int worker_init(worker_t *worker, proxy_t *proxy) {
     worker->proxy = proxy;
     worker->events = calloc(opt_epoll_max_events, sizeof(struct epoll_event));
-    return 0;
+    return MYSW_OK;
 }
 
 int worker_spawn(worker_t *worker) {
@@ -19,32 +18,47 @@ int worker_spawn(worker_t *worker) {
 
 int worker_join(worker_t *worker) {
     if (worker->spawned) pthread_join(worker->thread, NULL);
-    return 0;
+    return MYSW_OK;
 }
 
 int worker_deinit(worker_t *worker) {
     if (worker->events) free(worker->events);
-    return 0;
+    return MYSW_OK;
 }
 
-static int worker_accept_conn(worker_t *worker) {
+int worker_accept_conn(fdh_t *fdh) {
+    proxy_t *proxy;
+    client_t *client;
     int connfd, sock_flags;
 
+    proxy = fdh->u.proxy;
+
     /* Accept client conn */
-    if ((connfd = accept(worker->proxy->fdh_listen.fd, NULL, NULL)) < 0) {
+    if ((connfd = accept(proxy->fdh_listen.fd, NULL, NULL)) < 0) {
         perror("worker_accept_conn: accept");
-        return 1;
+        return MYSW_ERR;
     }
 
     /* Set non-blocking mode */
     if ((sock_flags = fcntl(connfd, F_GETFL, 0)) < 0 || fcntl(connfd, F_SETFL, sock_flags | O_NONBLOCK) < 0) {
         perror("worker_accept_conn: fcntl");
         close(connfd);
-        return 1;
+        return MYSW_ERR;
     }
 
     /* Create client */
-    return client_new(worker, connfd, NULL);
+    if (client_new(proxy, connfd, &client) != MYSW_OK) {
+        close(connfd);
+        return MYSW_ERR;
+    }
+
+    /* Watch client socket */
+    if (fdh_watch(&client->fdh_conn) != MYSW_OK) {
+        client->fdh_conn.destroy = 1;
+        return MYSW_ERR;
+    }
+
+    return MYSW_OK;
 }
 
 static void *worker_main(void *arg) {
@@ -70,25 +84,23 @@ static void *worker_main(void *arg) {
         for (i = 0; i < nfds; ++i) {
             fdh = (fdh_t *)events[i].data.ptr;
 
-            if (fdh->skip_read_write) {
-                /* Skip generic io */
-            } else {
-                /* Do generic io */
-                fdh_read_write(fdh);
+            /* Invoke read/write handler (usually fdh_read_write) */
+            if (fdh->fn_read_write) {
+                (fdh->fn_read_write)(fdh);
             }
 
-            /* Call owner-specific handler */
-            switch (fdh->type) {
-                case FDH_TYPE_PROXY:  worker_accept_conn(worker);    break;
-                case FDH_TYPE_CLIENT: client_process(fdh->u.client); break;
-                /* case FDH_TYPE_SERVER: server_process(fdh->u.server); break; */
-                default: fprintf(stderr, "worker_main: Unrecognized fdh type %d\n", fdh->type);
-            }
+            /* Invoke type-specific handler (client_process, server_process, etc) */
+            (fdh->fn_process)(fdh);
 
-            /* Rewatch/unwatch fd */
-            if (fdh->epoll_flags != 0) {
+            if (fdh->destroy) {
+                /* Unwatch and destroy */
+                fdh_unwatch(fdh);
+                (fdh->fn_destroy)(fdh);
+            } else if (fdh->epoll_flags != 0) { /* TODO test for EPOLLIN/OUT */
+                /* Rewatch */
                 fdh_rewatch(fdh);
             } else {
+                /* Unwatch */
                 fdh_unwatch(fdh);
             }
         }

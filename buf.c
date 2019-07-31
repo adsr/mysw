@@ -8,13 +8,26 @@ int buf_append_u8(buf_t *buf, uint8_t i) {
     return buf_append_void(buf, &i, sizeof(i));
 }
 
+int buf_append_u8_repeat(buf_t *buf, uint8_t i, int repeat) {
+    int c, rv;
+    for (c = 0; c < repeat; ++c) {
+        rv = buf_append_void(buf, &i, sizeof(i));
+        if (rv != MYSW_OK) return rv;
+    }
+    return MYSW_OK;
+}
+
 int buf_append_u16(buf_t *buf, uint16_t i) {
+    return buf_append_void(buf, &i, sizeof(i));
+}
+
+int buf_append_u32(buf_t *buf, uint32_t i) {
     return buf_append_void(buf, &i, sizeof(i));
 }
 
 int buf_clear(buf_t *buf) {
     buf->len = 0;
-    return 0;
+    return MYSW_OK;
 }
 
 int buf_ensure_cap(buf_t *buf, size_t cap) {
@@ -22,7 +35,7 @@ int buf_ensure_cap(buf_t *buf, size_t cap) {
         buf->data = realloc(buf->data, cap);
         buf->cap = cap;
     }
-    return 0;
+    return MYSW_OK;
 }
 
 int buf_free(buf_t *buf) {
@@ -31,7 +44,7 @@ int buf_free(buf_t *buf) {
         buf->data = NULL;
     }
     memset(buf, 0, sizeof(buf_t));
-    return 0;
+    return MYSW_OK;
 }
 
 char *buf_get_str(buf_t *buf, size_t pos) {
@@ -68,14 +81,21 @@ char *buf_get_strx(buf_t *buf, size_t pos, size_t *opt_len, int until_eof) {
 
 int buf_get_void(buf_t *buf, size_t pos, void *dest, size_t len) {
     if (pos + len > buf->len) {
-        return 1;
+        return MYSW_ERR;
     }
     memcpy(dest, buf->data + pos, len);
-    return 0;
+    return MYSW_OK;
 }
 
 uint8_t buf_get_u8(buf_t *buf, size_t pos) {
     uint8_t i;
+    i = 0;
+    buf_get_void(buf, pos, &i, sizeof(i));
+    return i;
+}
+
+uint16_t buf_get_u16(buf_t *buf, size_t pos) {
+    uint16_t i;
     i = 0;
     buf_get_void(buf, pos, &i, sizeof(i));
     return i;
@@ -105,10 +125,10 @@ int buf_set_u24(buf_t *buf, size_t pos, uint32_t i) {
 
 int buf_set_void(buf_t *buf, size_t pos, void *data, size_t len) {
     if (pos + len > buf->len) {
-        return 1;
+        return MYSW_ERR;
     }
     memcpy(buf->data + pos, data, len);
-    return 0;
+    return MYSW_OK;
 }
 
 int buf_append_void(buf_t *buf, void *data, size_t len) {
@@ -116,5 +136,5 @@ int buf_append_void(buf_t *buf, void *data, size_t len) {
     memcpy(buf->data + buf->len, data, len);
     buf->len += len;
     *(buf->data + buf->len) = '\0';
-    return 0;
+    return MYSW_OK;
 }
