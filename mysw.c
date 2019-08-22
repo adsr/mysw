@@ -16,6 +16,7 @@ static int done_pipe[2];
 
 int main(int argc, char **argv) {
     int i, exit_code;
+    int listenfd;
     struct sockaddr_in addr;
     proxy_t *proxy;
     server_t *server;
@@ -30,32 +31,52 @@ int main(int argc, char **argv) {
 
     /* Init proxy global */
     proxy = calloc(1, sizeof(proxy_t));
-    proxy->fdh_listen.proxy = proxy;
-    proxy->fdh_listen.type = FDH_TYPE_PROXY;
-    proxy->fdh_listen.u.proxy = proxy;
-    proxy->fdh_listen.fn_read_write = NULL;
-    proxy->fdh_listen.fn_process = worker_accept_conn;
-    proxy->fdh_listen.fn_destroy = NULL;
-    proxy->fdh_listen.fd = -1;
-    proxy->fdh_listen.epoll_flags = EPOLLIN;
-    proxy->epfd = -1;
     proxy->workers = calloc(opt_num_threads, sizeof(worker_t));
-
-    /* Create epoll fd */
-    if ((proxy->epfd = epoll_create(1)) < 0) {
-        perror("epoll_create");
-        goto main_error;
-    }
 
     /* Create signal handling thread */
     pthread_create(&proxy->signal_thread, NULL, signal_main, proxy);
-    signal_block_all();
+    signal_block_all(); /* For all other threads, block all signals */
+
+    /* Create listener socket */
+    listenfd = -1;
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("main: socket");
+        goto main_error;
+    }
+
+    /* Bind to port */
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = opt_addr ? inet_addr(opt_addr) : INADDR_ANY;
+    addr.sin_port = htons(opt_port);
+    if (bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("main: bind");
+        goto main_error;
+    }
+
+    /* Start listening */
+    if (listen(listenfd, opt_backlog) < 0) {
+        perror("main: listen");
+        goto main_error;
+    }
+
+    /* Create event loop (epoll wrapper) */
+    if (fdpoll_new(proxy, &proxy->fdpoll) != MYSW_OK) {
+        goto main_error;
+    }
+
+    /* Add listener socket to event loop */
+    fdh_init(&proxy->fdh_listen, proxy->fdpoll, FDH_TYPE_PROXY, proxy, listenfd, fdh_no_read_write, worker_accept_conn);
+    fdh_set_epoll_flags(&proxy->fdh_listen, EPOLLIN);
+    if (fdh_watch(&proxy->fdh_listen) != MYSW_OK) {
+        goto main_error;
+    }
 
     /* Connect to local mysqld */
     /* TODO let user-script do this */
     /* TODO server pools */
     server_new(proxy, "127.0.0.1", 3306, &server);
-    server_connect(server);
+    server_process_connect(server);
 
     /* Create worker threads */
     for (i = 0; i < opt_num_threads; ++i) {
@@ -66,38 +87,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Create listener socket */
-    if ((proxy->fdh_listen.fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket");
-        goto main_error;
-    }
-
-    /* Bind to port */
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = opt_addr ? inet_addr(opt_addr) : INADDR_ANY;
-    addr.sin_port = htons(opt_port);
-    if (bind(proxy->fdh_listen.fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        goto main_error;
-    }
-
-    /* Start listening */
-    if (listen(proxy->fdh_listen.fd, opt_backlog) < 0) {
-        perror("listen");
-        goto main_error;
-    }
-
-    /* Poll listener socket */
-    if (fdh_watch(&proxy->fdh_listen) < 0) {
-        goto main_error;
-    }
-
     exit_code = 0;
     goto main_done;
 
 main_error:
-    proxy->done = 1;
+    if (proxy->fdpoll) fdpoll_set_done(proxy->fdpoll);
 
 main_done:
     /* TODO destroy clients, servers */
@@ -105,8 +99,9 @@ main_done:
         worker_join(&proxy->workers[i]);
         worker_deinit(&proxy->workers[i]);
     }
-    if (proxy->epfd != -1) close(proxy->epfd);
-    if (proxy->fdh_listen.fd != -1) close(proxy->fdh_listen.fd);
+    /* TODO join signal thread */
+    if (listenfd != -1) close(listenfd);
+    if (proxy->fdpoll) fdpoll_free(proxy->fdpoll);
     if (proxy->workers) free(proxy->workers);
     free(proxy);
 
@@ -148,8 +143,8 @@ static void *signal_main(void *arg) {
     /* Read pipe for fun */
     rv = read(done_pipe[0], &signum, sizeof(int));
 
-    /* Set done flag */
-    proxy->done = 1;
+    /* End event loop */
+    fdpoll_set_done(proxy->fdpoll);
     /* TODO broadcast all conditions */
 
     return NULL;

@@ -1,42 +1,35 @@
 #include "mysw.h"
 
-static int client_process_command_ready(client_t *client);
-static int client_process_connected(client_t *client);
-static int client_process_handshake_received_init(client_t *client);
-static int client_process_handshake_sent_response(client_t *client);
-static int client_process_command_ready(client_t *client);
+static int client_process_recv_handshake_init(client_t *client);
+static int client_process_send_handshake_init_res(client_t *client);
+static int client_process_recv_handshake_res(client_t *client);
+static int client_process_send_cmd(client_t *client);
+static int client_process_send_cmd_inner(client_t *client);
+static int client_process_wait_cmd_res(client_t *client);
+static int client_process_recv_cmd_res(client_t *client);
+static int client_set_state(client_t *client, int state, fdh_t *fdh, int epoll_flags);
+
 
 int client_new(proxy_t *proxy, int connfd, client_t **out_client) {
     client_t *client;
     int efd;
 
+    /* Make event fd */
     if ((efd = eventfd(0, EFD_NONBLOCK)) < 0) {
+        perror("client_new: eventfd");
         return MYSW_ERR;
     }
 
     client = calloc(1, sizeof(client_t));
 
-    /* Socket events (client socket is readable or writeable) */
-    client->fdh_conn.proxy = proxy;
-    client->fdh_conn.type = FDH_TYPE_CLIENT;
-    client->fdh_conn.u.client = client;
-    client->fdh_conn.fn_read_write = fdh_read_write;
-    client->fdh_conn.fn_process = client_process;
-    client->fdh_conn.fn_destroy = client_destroy;
-    client->fdh_conn.fd = connfd;
-    client->fdh_conn.epoll_flags = EPOLLOUT; /* Initially poll for writeable client */
+    /* Init socket event handle (network io) */
+    fdh_init(&client->fdh_socket, proxy->fdpoll, FDH_TYPE_CLIENT, client, connfd, fdh_read_write, client_process);
 
-    /* Application events (e.g., to deliver results to a client) */
-    client->fdh_event.proxy = proxy;
-    client->fdh_event.type = FDH_TYPE_CLIENT;
-    client->fdh_event.u.client = client;
-    client->fdh_event.fn_read_write = NULL;
-    client->fdh_event.fn_process = client_process;
-    client->fdh_event.fn_destroy = client_destroy;
-    client->fdh_event.fd = eventfd(0, EFD_NONBLOCK);
-    client->fdh_event.epoll_flags = EPOLLIN;
+    /* Init application event handle (internal eventfd) */
+    fdh_init(&client->fdh_event, proxy->fdpoll, FDH_TYPE_CLIENT, client, efd, fdh_read_u64, client_process);
 
-    client->state = CLIENT_STATE_CONNECTED;
+    /* Initially poll for writeable client socket */
+    client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, &client->fdh_socket, EPOLLOUT);
 
     if (out_client) *out_client = client;
 
@@ -47,31 +40,29 @@ int client_process(fdh_t *fdh) {
     int rv;
     client_t *client;
 
-    client = fdh->u.client;
-    if (client->fdh_conn.read_eof || client->fdh_conn.read_write_errno) {
+    client = fdh->udata;
+    pthread_spin_lock(&client->spinlock);
+
+    if (client->fdh_socket.read_eof || client->fdh_socket.read_write_errno) {
         /* The client disconnected or there was a read/write error */
-        fdh->destroy = 1;
+        /* TODO mark for destruction instead of destroying */
+        /* TODO write async event that loops until refcount==0 to safely destroy the client */
+        client_destroy(client);
         return MYSW_OK;
     }
 
     switch (client->state) {
-        case CLIENT_STATE_CONNECTED:
-            rv = client_process_connected(client);
-            break;
-        case CLIENT_STATE_HANDSHAKE_RECEIVED_INIT:
-            rv = client_process_handshake_received_init(client);
-            break;
-        case CLIENT_STATE_HANDSHAKE_SENT_RESPONSE:
-            rv = client_process_handshake_sent_response(client);
-            break;
-        case CLIENT_STATE_COMMAND_READY:
-            rv = client_process_command_ready(client);
-            break;
-        default:
-            fprintf(stderr, "client_process: Invalid client state %d\n", client->state);
-            rv = MYSW_ERR;
-            break;
+        case CLIENT_STATE_RECV_HANDSHAKE_INIT:     rv = client_process_recv_handshake_init(client); break;
+        case CLIENT_STATE_SEND_HANDSHAKE_INIT_RES: rv = client_process_send_handshake_init_res(client); break;
+        case CLIENT_STATE_RECV_HANDSHAKE_RES:      rv = client_process_recv_handshake_res(client); break;
+        case CLIENT_STATE_SEND_CMD:                rv = client_process_send_cmd(client); break;
+        case CLIENT_STATE_WAIT_CMD_RES:            rv = client_process_wait_cmd_res(client); break;
+        case CLIENT_STATE_RECV_CMD_RES:            rv = client_process_recv_cmd_res(client); break;
+        default: fprintf(stderr, "client_process: Invalid client state %d\n", client->state); rv = MYSW_ERR; break;
     }
+
+    pthread_spin_unlock(&client->spinlock);
+
     return rv;
 }
 
@@ -79,24 +70,17 @@ int client_process(fdh_t *fdh) {
  * The client just connected. Send an Initial Handshake Packet.
  * https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
  */
-static int client_process_connected(client_t *client) {
+static int client_process_recv_handshake_init(client_t *client) {
     uint32_t capability_flags;
     int i;
     uchar challenge[21];
     buf_t *out;
-    fdh_t *fdh_conn;
+    fdh_t *fdh_socket;
 
-    fdh_conn = &client->fdh_conn;
+    fdh_socket = &client->fdh_socket;
 
-    if (fdh_is_write_finished(fdh_conn)) {
-        /* Finished writing handshake packet. Transition state. */
-        fdh_reset_rw_state(fdh_conn);
-        client->state = CLIENT_STATE_HANDSHAKE_RECEIVED_INIT;
-        client->fdh_conn.epoll_flags = EPOLLIN; /* poll for readable client */
-    } else if (fdh_is_writing(fdh_conn)) {
-        /* Continue writing packet (do nothing) */
-    } else {
-        /* Send handshake packet */
+    if (!fdh_is_writing(fdh_socket)) {
+        /* Queue handshake packet */
 
         /* Init challenge */
         for (i = 0; i < 20; ++i) challenge[i] = (uchar)rand();
@@ -110,7 +94,8 @@ static int client_process_connected(client_t *client) {
 
         /* Build init packet */
         /* TODO support other caps, auth, ssl */
-        out = &fdh_conn->out;
+        fdh_reset_rw_state(fdh_socket);
+        out = &fdh_socket->out;
         buf_clear(out);
         buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
         buf_append_u8(out, '\x00');                             /* sequence id (1) */
@@ -128,18 +113,22 @@ static int client_process_connected(client_t *client) {
         buf_append_str_len(out, (char *)(challenge + 8), 13);   /* challenge[8:] */
         buf_append_str_len(out, "mysql_native_password\x00", 22);
         buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
-
-        client->fdh_conn.epoll_flags = EPOLLOUT; /* poll for writeable client */
     }
-    return MYSW_OK;
+
+    if (fdh_is_write_finished(fdh_socket)) {
+        /* Finished writing; transition state */
+        return client_set_state(client, CLIENT_STATE_SEND_HANDSHAKE_INIT_RES, &client->fdh_socket, EPOLLIN);
+    }
+
+    /* Not yet finished writing; re-arm */
+    return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, &client->fdh_socket, EPOLLOUT);
 }
 
-/**
- * The client finished receiving the handshake packet. We now expect the client
+/* The client finished receiving the handshake packet. We now expect the client
  * to send a response including auth. Then we reply with either an OK or an ERR
  * packet, and the connection moves into the command phase.
  */
-static int client_process_handshake_received_init(client_t *client) {
+static int client_process_send_handshake_init_res(client_t *client) {
     buf_t *in, *out;
     size_t cur;
     int capability_flags;
@@ -151,11 +140,14 @@ static int client_process_handshake_received_init(client_t *client) {
     char *username, *auth, *dbname, *plugin;
     size_t username_len, auth_len, dbname_len, plugin_len;
 
-    in = &client->fdh_conn.in;
-    if (!util_has_complete_mysql_packet(&client->fdh_conn.in)) {
-        return MYSW_OK;
+    in = &client->fdh_socket.in;
+
+    if (!util_has_complete_mysql_packet(in)) {
+        /* Have not received a complete packet yet; re-arm */
+        return client_set_state(client, CLIENT_STATE_SEND_HANDSHAKE_INIT_RES, &client->fdh_socket, EPOLLIN);
     }
 
+    /* We have a complete packet; parse and respond */
     /* https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html */
     cur = 0;
     payload_len = buf_get_u24(in, cur);                 cur += 3;
@@ -186,6 +178,7 @@ static int client_process_handshake_received_init(client_t *client) {
     }
 
     /* TODO actually auth */
+    /* TODO queue ERR packet if failed auth */
     (void)username;
     (void)auth;
     (void)dbname;
@@ -194,11 +187,13 @@ static int client_process_handshake_received_init(client_t *client) {
     (void)max_packet_size;
     (void)payload_len;
 
-    out = &client->fdh_conn.out;
-    server_status_flags = MYSQLD_SERVER_STATUS_AUTOCOMMIT; /* TODO hmm */
+    /* Queue OK packet */
+    fdh_reset_rw_state(&client->fdh_socket);
+    out = &client->fdh_socket.out;
+    server_status_flags = MYSQLD_SERVER_STATUS_AUTOCOMMIT; /* TODO figure out init server_status_flags */
     buf_clear(out);
     buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
-    buf_append_u8(out, sequence_id+1);                      /* sequence id (1) */
+    buf_append_u8(out, sequence_id + 1);                    /* sequence id (1) */
     buf_append_u8(out, '\x00');                             /* OK packet header */
     buf_append_u8(out, '\x00');                             /* affected rows (lenenc) */
     buf_append_u8(out, '\x00');                             /* last insert id (lenenc) */
@@ -206,127 +201,153 @@ static int client_process_handshake_received_init(client_t *client) {
     buf_append_u16(out, 0);                                 /* warnings (2) */
     buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
 
-    client->state = CLIENT_STATE_HANDSHAKE_SENT_RESPONSE;
-    client->fdh_conn.epoll_flags = EPOLLOUT; /* poll for writeable client */
-    return MYSW_OK;
+    /* Transition state */
+    return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket, EPOLLOUT);
 }
 
-static int client_process_handshake_sent_response(client_t *client) {
-    if (fdh_is_write_finished(&client->fdh_conn)) {
-        fdh_reset_rw_state(&client->fdh_conn);
-        client->state = CLIENT_STATE_COMMAND_READY;
-        client->fdh_conn.epoll_flags = EPOLLIN; /* poll for readable client */
+static int client_process_recv_handshake_res(client_t *client) {
+    if (!fdh_is_write_finished(&client->fdh_socket)) {
+        /* We have not finished writing to the client; re-arm */
+        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket, EPOLLOUT);
     }
-    return MYSW_OK;
+
+    /* We have finished writing to the client; transition state */
+    return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket, EPOLLIN);
 }
 
-static int client_process_command_ready(client_t *client) {
+
+static int client_process_send_cmd(client_t *client) {
     buf_t *in;
-    int command_byte;
-    char *sql;
-    size_t sql_len;
 
-    in = &client->fdh_conn.in;
+    in = &client->fdh_socket.in;
+
     if (!util_has_complete_mysql_packet(in)) {
-        return MYSW_OK;
+        /* Client has not sent a complete packet yet; re-arm */
+        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket, EPOLLIN);
     }
 
-    command_byte = buf_get_u8(in, 4);
+    cmd_init(client, in, &client->cmd);
 
-    switch (command_byte) {
-        case MYSQLD_COM_QUERY:
-        case MYSQLD_COM_STMT_PREPARE:
-            /* TODO parse out USE statement, retarget, forward */
-            /* TODO prevent retarget in transaction */
-            sql = buf_get_streof(in, 5, &sql_len);
-            printf("sql='%.*s'\n", (int)sql_len, sql);
-            break;
-        case MYSQLD_COM_INIT_DB:
-            /* TODO retarget, forward */
-            break;
-        case MYSQLD_COM_QUIT:
-            /* TODO quit */
-            break;
-        /* TODO? case COM_CHANGE_USER */
-        /* TODO? case COM_RESET_CONNECTION */
-        /* TODO? case COM_SET_OPTION */
-        default:
-            /* TODO if we have a target, forward. if not, err */
-            break;
-        /*
-        COM_BINLOG_DUMP
-        COM_BINLOG_DUMP_GTID
-        COM_CHANGE_USER
-        COM_CONNECT
-        COM_CONNECT_OUT
-        COM_CREATE_DB
-        COM_DAEMON
-        COM_DEBUG
-        COM_DELAYED_INSERT
-        COM_DROP_DB
-        COM_FIELD_LIST
-        COM_INIT_DB
-        COM_PING
-        COM_PROCESS_INFO
-        COM_PROCESS_KILL
-        COM_QUERY
-        COM_QUIT
-        COM_REFRESH
-        COM_REGISTER_SLAVE
-        COM_SET_OPTION
-        COM_SHUTDOWN
-        COM_SLEEP
-        COM_STATISTICS
-        COM_STMT_CLOSE
-        COM_STMT_EXECUTE
-        COM_STMT_FETCH
-        COM_STMT_PREPARE
-        COM_STMT_RESET
-        COM_STMT_SEND_LONG_DATA
-        COM_TABLE_DUMP
-        COM_TIME
-        */
-    }
-
-    (void)sql;
-
-    /* TODO some commands expect a response, others do not */
-    /*      set epoll_flags depending on that */
-
-    /*
-    timeline:
-    - client/proxy do handshake
-    - client sends "use ...; select ...;"
-    - proxy parses sql
-    - proxy processes "use...", sets client target (pool) (disallow retarget in transaction)
-    - proxy processes "select...", adds command to pool queue
-    - writes to pool's eventfd (or specific server eventfd if in txn)
-    - worker picks up eventfd, calls pool_process / server_process
-    - pool reserves a server to handle next command in pool queue
-    - proxy writes command to server
-    - server->processing_command = cmd
-    - server responds
-    - server writes response to client queue
-    */
-
-    return MYSW_OK;
+    return client_process_send_cmd_inner(client);
 }
 
-int client_destroy(fdh_t *fdh) {
-    client_t *client;
-    client = fdh->u.client;
-    client->fdh_conn.epoll_flags = 0;
-    client->fdh_event.epoll_flags = 0;
-    close(client->fdh_conn.fd);
+static int client_process_send_cmd_inner(client_t *client) {
+    if (client->in_txn || client->in_prep_stmt) {
+        /* Need specific mysqld */
+        /* TODO assert target_server is present*/
+        /* TODO assert target_server is reserved for us */
+        server_set_client(client->target_server, client);
+        server_wakeup(client->target_server);
+    } else if (!client->target_pool || client->cmd.is_target_cmd) {
+        /* Need to target */
+        targeter_queue_client(client->proxy->targeter, client);
+        targeter_wakeup(client->proxy->targeter);
+    } else {
+        /* Use existing target (client->target_pool) */
+        pool_queue_client(client->target_pool, client);
+        pool_wakeup(client->target_pool);
+    }
+
+    return client_set_state(client, CLIENT_STATE_WAIT_CMD_RES, &client->fdh_event, EPOLLIN);
+}
+
+static int client_process_wait_cmd_res(client_t *client) {
+    if (!client->cmd.stmt_cur->next) {
+        /* No more stmts. Time to send results.*/
+        return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_event, EPOLLOUT);
+    }
+
+    /* Process next stmt in cmd */
+    client->cmd.stmt_cur = client->cmd.stmt_cur->next;
+    return client_process_send_cmd_inner(client);
+}
+
+static int client_process_recv_cmd_res(client_t *client) {
+    int i;
+    buf_t *out;
+    fdh_t *fdh_socket;
+
+    fdh_socket = &client->fdh_socket;
+
+    if (!fdh_is_writing(fdh_socket)) {
+        /* Queue results */
+        fdh_reset_rw_state(fdh_socket);
+        out = &fdh_socket->out;
+        buf_copy_from(out, &client->cmd_result);
+        buf_clear(&client->cmd_result);
+    }
+
+    if (fdh_is_write_finished(fdh_socket)) {
+        /* Finished writing; transition state */
+        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket, EPOLLIN);
+    }
+
+    /* Not yet finished writing; re-arm */
+    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket, EPOLLOUT);
+}
+
+int client_destroy(client_t *client) {
+    fdh_ensure_unwatched(&client->fdh_socket);
+    fdh_ensure_unwatched(&client->fdh_event);
+    close(client->fdh_socket.fd);
     close(client->fdh_event.fd);
-    buf_free(&client->fdh_conn.in);
-    buf_free(&client->fdh_conn.out);
-    /* TODO eh */
+    buf_free(&client->fdh_socket.in);
+    buf_free(&client->fdh_socket.out);
+    /* TODO avoid use after free, e.g., other objects may have client pointer */
     free(client);
     return MYSW_OK;
 }
 
+static int client_set_state(client_t *client, int state, fdh_t *fdh, int epoll_flags) {
+    int rv;
+
+    /* Unwatch the other fdh */
+    if (fdh == &client->fdh_socket) {
+        try(rv, fdh_ensure_unwatched(&client->fdh_event));
+    } else {
+        try(rv, fdh_ensure_unwatched(&client->fdh_socket));
+    }
+
+    /* Watch the specified fdh */
+    fdh_set_epoll_flags(fdh, epoll_flags);
+    try(rv, fdh_ensure_watched(fdh));
+
+    /* Set state */
+    client->state = state;
+    return MYSW_OK;
+}
+
 /*
+
+static int client_process_command_executing(client_t *client) {
+    stmt_t *stmt;
+
+    stmt = client->stmt_list;
+    if (!stmt) {
+        client->state = CLIENT_STATE_COMMAND_READY;
+        client->fdh_socket.
+        fdh_watch(&client->fdh_socket); // TODO handle connection error (retry later?)
+    }
+    while (stmt) {
+        if (strncasecmp("use", stmt->cmd, stmt->cmd_len) == 0) {
+            
+        }
+        stmt = stmt->next;
+    }
+
+    /* TODO parse out USE statement, retarget, forward */
+    /* TODO prevent retarget in transaction */
+    /* TODO foreach stmt:
+     *        if use: set db
+     *        ask user-script where to go (array for teeing, empty for blackhole)
+     *        queue command on target
+     *        target moves into reserved state (rwlock)
+     *        wakeup target via eventfd write
+     *        target wakes up and dequeues command
+     *        
+    /* TODO queue command on target pool or specific server (rwlock) */
+    /* TODO wakeup pool or specific server (eventfd)
+
 
 0000: 5300 0000 0a35 2e36 2e34 312d 3834 2e31 2d6c 6f67 0012 fc7c 0036 2d7c 4c45 5456  S....5.6.41-84.1-log...|.6-|LETV
 0020: 3300 fff7 2102 007f 8015 0000 0000 0000 0000 0000 3c72 4d69 4767 4f38 6a2d 3d2d  3...!...............<rMiGgO8j-=-

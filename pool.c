@@ -33,3 +33,12 @@ int pool_destroy(pool_t *pool) {
     free(pool);
     return MYSW_OK;
 }
+
+
+int pool_queue_client(pool_t *pool, client_t *client) {
+    return MYSW_ERR;
+}
+
+int pool_wakeup(pool_t *pool) {
+    return MYSW_ERR;
+}

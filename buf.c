@@ -79,7 +79,19 @@ char *buf_get_strx(buf_t *buf, size_t pos, size_t *opt_len, int until_eof) {
     return str;
 }
 
-int buf_get_void(buf_t *buf, size_t pos, void *dest, size_t len) {
+uint8_t *buf_get(buf_t *buf, size_t pos) {
+    if (pos >= buf->len) {
+        return MYSW_ERR;
+    }
+    return buf->data + pos;
+}
+
+int buf_copy_from(buf_t *buf, buf_t *other) {
+    buf_clear(buf);
+    buf_append_void(buf, other->data, other->len);
+}
+
+int buf_copy_to(buf_t *buf, size_t pos, void *dest, size_t len) {
     if (pos + len > buf->len) {
         return MYSW_ERR;
     }
@@ -90,28 +102,28 @@ int buf_get_void(buf_t *buf, size_t pos, void *dest, size_t len) {
 uint8_t buf_get_u8(buf_t *buf, size_t pos) {
     uint8_t i;
     i = 0;
-    buf_get_void(buf, pos, &i, sizeof(i));
+    buf_copy_to(buf, pos, &i, sizeof(i));
     return i;
 }
 
 uint16_t buf_get_u16(buf_t *buf, size_t pos) {
     uint16_t i;
     i = 0;
-    buf_get_void(buf, pos, &i, sizeof(i));
+    buf_copy_to(buf, pos, &i, sizeof(i));
     return i;
 }
 
 uint32_t buf_get_u24(buf_t *buf, size_t pos) {
     uint32_t i;
     i = 0;
-    buf_get_void(buf, pos, &i, 3);
+    buf_copy_to(buf, pos, &i, 3);
     return i;
 }
 
 uint32_t buf_get_u32(buf_t *buf, size_t pos) {
     uint32_t i;
     i = 0;
-    buf_get_void(buf, pos, &i, sizeof(i));
+    buf_copy_to(buf, pos, &i, sizeof(i));
     return i;
 }
 
