@@ -7,6 +7,7 @@ int opt_num_threads = 1; /* TODO saner default */
 int opt_epoll_max_events = 256;
 int opt_epoll_timeout_ms = 1000;
 int opt_read_size = 256;
+server_t *the_server = NULL;
 
 static void *signal_main(void *arg);
 static void signal_handle(int signum);
@@ -16,7 +17,7 @@ static int done_pipe[2];
 
 int main(int argc, char **argv) {
     int i, exit_code;
-    int listenfd;
+    int listenfd, optval;
     struct sockaddr_in addr;
     proxy_t *proxy;
     server_t *server;
@@ -31,6 +32,8 @@ int main(int argc, char **argv) {
 
     /* Init proxy global */
     proxy = calloc(1, sizeof(proxy_t));
+
+    /* Init workers */
     proxy->workers = calloc(opt_num_threads, sizeof(worker_t));
 
     /* Create signal handling thread */
@@ -41,6 +44,13 @@ int main(int argc, char **argv) {
     listenfd = -1;
     if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("main: socket");
+        goto main_error;
+    }
+
+    /* Set SO_REUSEPORT */
+    optval = 1;
+    if ((setsockopt(listenfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval))) < 0) {
+        perror("main: setsockopt");
         goto main_error;
     }
 
@@ -65,6 +75,9 @@ int main(int argc, char **argv) {
         goto main_error;
     }
 
+    /* Init targeter */
+    targeter_new(proxy, &proxy->targeter);
+
     /* Add listener socket to event loop */
     fdh_init(&proxy->fdh_listen, proxy->fdpoll, FDH_TYPE_PROXY, proxy, listenfd, fdh_no_read_write, worker_accept_conn);
     fdh_set_epoll_flags(&proxy->fdh_listen, EPOLLIN);
@@ -77,6 +90,7 @@ int main(int argc, char **argv) {
     /* TODO server pools */
     server_new(proxy, "127.0.0.1", 3306, &server);
     server_process_connect(server);
+    the_server = server;
 
     /* Create worker threads */
     for (i = 0; i < opt_num_threads; ++i) {

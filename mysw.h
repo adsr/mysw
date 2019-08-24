@@ -1,3 +1,6 @@
+#ifndef __MYSW_H
+#define __MYSW_H
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,7 +66,7 @@ typedef struct _cmd_t cmd_t;
 typedef unsigned char uchar;
 
 struct _buf_t {
-    char *data;
+    uchar *data;
     size_t len;
     size_t cap;
 };
@@ -77,9 +80,11 @@ struct _fdpoll_t {
 
 struct _fdh_t {
     fdpoll_t *fdpoll;
-    #define FDH_TYPE_PROXY  0
-    #define FDH_TYPE_CLIENT 1
-    #define FDH_TYPE_SERVER 2
+    #define FDH_TYPE_PROXY    0
+    #define FDH_TYPE_CLIENT   1
+    #define FDH_TYPE_SERVER   2
+    #define FDH_TYPE_TARGETER 3
+    #define FDH_TYPE_POOL     4
     int type;
     void *udata;
     int idata;
@@ -159,7 +164,7 @@ struct _server_t {
     #define SERVER_STATE_SEND_HANDSHAKE_INIT         5
     #define SERVER_STATE_RECV_HANDSHAKE_INIT_RES     6
     #define SERVER_STATE_SEND_HANDSHAKE_RES          7
-    #define SERVER_STATE_WAIT_CMD                    8
+    #define SERVER_STATE_WAIT_CLIENT                 8
     #define SERVER_STATE_RECV_CMD                    9
     #define SERVER_STATE_SEND_CMD_RES                10
     proxy_t *proxy;
@@ -167,6 +172,7 @@ struct _server_t {
     char *host;
     int port;
     int state;
+    client_t *target_client;
     fdh_t fdh_socket;
     fdh_t fdh_event;
     fdh_t fdh_timer;
@@ -229,6 +235,7 @@ int buf_append_void(buf_t *buf, void *data, size_t len);
 int client_new(proxy_t *proxy, int connfd, client_t **out_client);
 int client_process(fdh_t *fdh);
 int client_destroy(client_t *client);
+int client_wakeup(client_t *client);
 int cmd_init(client_t *client, buf_t *in, cmd_t *cmd);
 int cmd_parse_sql(cmd_t *cmd);
 int cmd_deinit(cmd_t *cmd);
@@ -265,12 +272,14 @@ int server_process_connecting(server_t *server);
 int server_process_send_handshake_init(server_t *server);
 int server_process_recv_handshake_init_res(server_t *server);
 int server_process_send_handshake_res(server_t *server);
-int server_process_wait_cmd(server_t *server);
+int server_process_wait_client(server_t *server);
 int server_process_recv_cmd(server_t *server);
 int server_process_send_cmd_res(server_t *server);
 int server_set_client(server_t *server, client_t *client);
 int server_wakeup(server_t *server);
 int server_destroy(fdh_t *fdh);
+int targeter_new(proxy_t *proxy, targeter_t **out_targeter);
+int targeter_process(fdh_t *fdh);
 int targeter_queue_client(targeter_t *targeter, client_t *client);
 int targeter_wakeup(targeter_t *targeter);
 int util_has_complete_mysql_packet(buf_t *in);
@@ -280,6 +289,8 @@ int worker_spawn(worker_t *worker);
 int worker_join(worker_t *worker);
 int worker_deinit(worker_t *worker);
 int worker_accept_conn(fdh_t *fdh);
+
+extern server_t *the_server;
 
 /* https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html */
 
@@ -386,3 +397,5 @@ POOL
                     
 
 */
+
+#endif

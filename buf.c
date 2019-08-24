@@ -81,7 +81,7 @@ char *buf_get_strx(buf_t *buf, size_t pos, size_t *opt_len, int until_eof) {
 
 uint8_t *buf_get(buf_t *buf, size_t pos) {
     if (pos >= buf->len) {
-        return MYSW_ERR;
+        return NULL;
     }
     return buf->data + pos;
 }
@@ -89,6 +89,7 @@ uint8_t *buf_get(buf_t *buf, size_t pos) {
 int buf_copy_from(buf_t *buf, buf_t *other) {
     buf_clear(buf);
     buf_append_void(buf, other->data, other->len);
+    return MYSW_OK;
 }
 
 int buf_copy_to(buf_t *buf, size_t pos, void *dest, size_t len) {

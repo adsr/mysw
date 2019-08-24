@@ -53,7 +53,7 @@ int worker_accept_conn(fdh_t *fdh) {
     }
 
     /* Watch client socket */
-    if (fdh_watch(&client->fdh_socket) != MYSW_OK) {
+    if (fdh_ensure_watched(&client->fdh_socket) != MYSW_OK) {
         /* TODO destroy */
         return MYSW_ERR;
     }

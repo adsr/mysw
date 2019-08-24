@@ -16,6 +16,11 @@ int server_new(proxy_t *proxy, char *host, int port, server_t **out_server) {
     }
 
     server = calloc(1, sizeof(server_t));
+
+    pthread_spin_init(&server->spinlock, PTHREAD_PROCESS_PRIVATE);
+    /* TODO pthread_spin_destroy */
+
+    server->proxy = proxy;
     server->fdh_socket.fd = -1;
     server->host = strdup(host);
     server->port = port;
@@ -43,8 +48,9 @@ int server_process(fdh_t *fdh) {
         /* The server disconnected or there was a read/write error */
         /* TODO mark for destruction instead of destroying */
         /* TODO write async event that loops until refcount==0 to safely destroy the server */
-        server_destroy(server);
-        return MYSW_OK;
+        /* TODO server_destroy(server); */
+        pthread_spin_unlock(&server->spinlock);
+        return server_set_state(server, SERVER_STATE_DISCONNECTED, NULL, 0);
     }
 
     switch (server->state) {
@@ -54,7 +60,7 @@ int server_process(fdh_t *fdh) {
         case SERVER_STATE_SEND_HANDSHAKE_INIT:     rv = server_process_send_handshake_init(server); break;
         case SERVER_STATE_RECV_HANDSHAKE_INIT_RES: rv = server_process_recv_handshake_init_res(server); break;
         case SERVER_STATE_SEND_HANDSHAKE_RES:      rv = server_process_send_handshake_res(server); break;
-        case SERVER_STATE_WAIT_CMD:                rv = server_process_wait_cmd(server); break;
+        case SERVER_STATE_WAIT_CLIENT:             rv = server_process_wait_client(server); break;
         case SERVER_STATE_RECV_CMD:                rv = server_process_recv_cmd(server); break;
         case SERVER_STATE_SEND_CMD_RES:            rv = server_process_send_cmd_res(server); break;
         default: fprintf(stderr, "server_process: Invalid server state %d\n", server->state); rv = MYSW_ERR; break;
@@ -280,22 +286,50 @@ int server_process_send_handshake_res(server_t *server) {
         return MYSW_ERR;
     }
 
-    server->state = SERVER_STATE_WAIT_CMD;
-    server->fdh_socket.epoll_flags = 0;
+    return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event, EPOLLIN);
+}
+
+int server_process_wait_client(server_t *server) {
+    buf_t *out;
+
+    /* TODO assert server->target_client */
+
+    out = &server->fdh_socket.out;
+    buf_clear(out);
+    buf_copy_from(out, server->target_client->cmd.payload);
+
+    return server_set_state(server, SERVER_STATE_RECV_CMD, &server->fdh_socket, EPOLLOUT);
+}
+
+int server_process_recv_cmd(server_t *server) {
+    fdh_t *fdh_socket;
+
+    fdh_socket = &server->fdh_socket;
+
+    if (fdh_is_write_finished(fdh_socket)) {
+        /* Finished writing handshake packet. Transition state. */
+        fdh_reset_rw_state(fdh_socket);
+        return server_set_state(server, SERVER_STATE_SEND_CMD_RES, &server->fdh_socket, EPOLLIN);
+    }
 
     return MYSW_OK;
 }
 
-int server_process_wait_cmd(server_t *server) {
-    return MYSW_ERR;
-}
-
-int server_process_recv_cmd(server_t *server) {
-    return MYSW_ERR;
-}
-
 int server_process_send_cmd_res(server_t *server) {
-    return MYSW_ERR;
+    buf_t *in;
+
+    in = &server->fdh_socket.in;
+
+    if (!util_has_complete_mysql_packet(in)) {
+        return MYSW_OK;
+    }
+
+    buf_copy_from(&server->target_client->cmd_result, in);
+    client_wakeup(server->target_client);
+
+    fdh_reset_rw_state(&server->fdh_socket);
+
+    return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event, EPOLLIN);
 }
 
 int server_set_client(server_t *server, client_t *client) {
@@ -303,7 +337,9 @@ int server_set_client(server_t *server, client_t *client) {
 }
 
 int server_wakeup(server_t *server) {
-    return MYSW_ERR;
+    uint64_t i;
+    i = 1;
+    return (write(server->fdh_event.fd, &i, sizeof(i)) == sizeof(i)) ? MYSW_OK : MYSW_ERR;
 }
 
 int server_destroy(fdh_t *fdh) {
@@ -323,8 +359,10 @@ static int server_set_state(server_t *server, int state, fdh_t *fdh, int epoll_f
     if (fdh != &server->fdh_timer)  try(rv, fdh_ensure_unwatched(&server->fdh_timer));
 
     /* Watch the specified fdh */
-    fdh_set_epoll_flags(fdh, epoll_flags);
-    try(rv, fdh_ensure_watched(fdh));
+    if (fdh) {
+        fdh_set_epoll_flags(fdh, epoll_flags);
+        try(rv, fdh_ensure_watched(fdh));
+    }
 
     /* Set state */
     server->state = state;

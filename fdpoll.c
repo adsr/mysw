@@ -9,10 +9,10 @@ int fdpoll_new(void *udata, fdpoll_t **out_fdpoll) {
     }
     fdpoll = calloc(1, sizeof(fdpoll_t));
     fdpoll->epoll_fd = epfd;
-    /* Use EPOLLONESHOT for thread safety. This comes at the cost of needing to
-     * manually re-arm fds after each epoll_wait. In Linux 4.5+ we can use
-     * EPOLLEXCLUSIVE instead of doing this dance. */
-    fdpoll->epoll_flags = EPOLLONESHOT;
+    /* Previously I was using EPOLLONESHOT for thread safety on older kernels,
+     * but I've had trouble getting that to work consistently. I am using the
+     * new hotness, EPOLLEXCLUSIVE, for now. */
+    fdpoll->epoll_flags = EPOLLEXCLUSIVE;
     fdpoll->udata = udata;
     *out_fdpoll = fdpoll;
     return MYSW_OK;
@@ -104,7 +104,7 @@ int fdh_ensure_unwatched(fdh_t *fdh) {
 int fdh_watch(fdh_t *fdh) {
     int rv, epoll_op;
     struct epoll_event ev;
-    int epoll_flags;
+    uint32_t epoll_flags;
 
     if (fdh->state != FDH_STATE_UNWATCHED && fdh->state != FDH_STATE_RAISED) {
         fprintf(stderr, "fdh_watch: Expected FDH_STATE_UNWATCHED or FDH_STATE_RAISED\n");
@@ -115,19 +115,28 @@ int fdh_watch(fdh_t *fdh) {
      * loop until EAGAIN in fdh_read. For writes, we cannot always write until
      * EAGAIN, so use default level-triggered behavior there. */
     /* TODO is EPOLLET ok for evetnfd and timerfd? */
-    epoll_flags = (fdh->epoll_flags & EPOLLIN) ? EPOLLET : 0;
+    if (fdh->fn_read_write == fdh_read_write && (fdh->epoll_flags & EPOLLIN)) {
+        epoll_flags = EPOLLET;
+    } else {
+        epoll_flags = 0;
+    }
 
     /* Init epoll_event */
     memset(&ev, 0, sizeof(ev));
     ev.events = fdh->fdpoll->epoll_flags | fdh->epoll_flags | epoll_flags;
     ev.data.ptr = fdh;
 
-    epoll_op = (fdh->state == FDH_STATE_RAISED) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+    if (fdh->state == FDH_STATE_RAISED) {
+        /* TODO EPOLLONESHOT */
+        /* Do nothing in EPOLLEXCLUSIVE mode */
+    } else {
+        epoll_op = (fdh->state == FDH_STATE_RAISED) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
 
-    /* Add to epoll */
-    if ((rv = epoll_ctl(fdh->fdpoll->epoll_fd, epoll_op, fdh->fd, &ev)) < 0) {
-        perror("fdh_watch: epoll_ctl");
-        return MYSW_ERR;
+        /* Add to epoll */
+        if ((rv = epoll_ctl(fdh->fdpoll->epoll_fd, epoll_op, fdh->fd, &ev)) < 0) {
+            perror("fdh_watch: epoll_ctl");
+            return MYSW_ERR;
+        }
     }
 
     fdh->state = FDH_STATE_WATCHED;
@@ -185,7 +194,7 @@ int fdh_read(fdh_t *fdh) {
     ssize_t rv;
     size_t len;
     buf_t *in;
-    char *buf;
+    uchar *buf;
 
     in = &fdh->in;
 
@@ -225,7 +234,7 @@ int fdh_write(fdh_t *fdh) {
     ssize_t rv;
     size_t len;
     buf_t *out;
-    char *buf;
+    uchar *buf;
 
     out = &fdh->out;
 

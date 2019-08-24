@@ -21,6 +21,10 @@ int client_new(proxy_t *proxy, int connfd, client_t **out_client) {
     }
 
     client = calloc(1, sizeof(client_t));
+    client->proxy = proxy;
+
+    pthread_spin_init(&client->spinlock, PTHREAD_PROCESS_PRIVATE);
+    /* TODO pthread_spin_destroy */
 
     /* Init socket event handle (network io) */
     fdh_init(&client->fdh_socket, proxy->fdpoll, FDH_TYPE_CLIENT, client, connfd, fdh_read_write, client_process);
@@ -228,6 +232,11 @@ static int client_process_send_cmd(client_t *client) {
 
     cmd_init(client, in, &client->cmd);
 
+    if (client->cmd.cmd_byte == MYSQLD_COM_QUIT) {
+        /* TODO client destroy */
+        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL, 0);
+    }
+
     return client_process_send_cmd_inner(client);
 }
 
@@ -252,30 +261,36 @@ static int client_process_send_cmd_inner(client_t *client) {
 }
 
 static int client_process_wait_cmd_res(client_t *client) {
+    fdh_t *fdh_socket;
+    buf_t *out;
+
+    fdh_socket = &client->fdh_socket;
+    out = &fdh_socket->out;
+
+    fdh_reset_rw_state(fdh_socket);
+    buf_copy_from(out, &client->cmd_result);
+    buf_clear(&client->cmd_result);
+
+    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket, EPOLLOUT);
+
+    /* TODO mult statements
+    
     if (!client->cmd.stmt_cur->next) {
-        /* No more stmts. Time to send results.*/
+        |* No more stmts. Time to send results.*|
         return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_event, EPOLLOUT);
     }
 
-    /* Process next stmt in cmd */
+    |* Process next stmt in cmd *|
     client->cmd.stmt_cur = client->cmd.stmt_cur->next;
     return client_process_send_cmd_inner(client);
+
+    */
 }
 
 static int client_process_recv_cmd_res(client_t *client) {
-    int i;
-    buf_t *out;
     fdh_t *fdh_socket;
 
     fdh_socket = &client->fdh_socket;
-
-    if (!fdh_is_writing(fdh_socket)) {
-        /* Queue results */
-        fdh_reset_rw_state(fdh_socket);
-        out = &fdh_socket->out;
-        buf_copy_from(out, &client->cmd_result);
-        buf_clear(&client->cmd_result);
-    }
 
     if (fdh_is_write_finished(fdh_socket)) {
         /* Finished writing; transition state */
@@ -298,19 +313,24 @@ int client_destroy(client_t *client) {
     return MYSW_OK;
 }
 
+int client_wakeup(client_t *client) {
+    uint64_t i;
+    i = 1;
+    return (write(client->fdh_event.fd, &i, sizeof(i)) == sizeof(i)) ? MYSW_OK : MYSW_ERR;
+}
+
 static int client_set_state(client_t *client, int state, fdh_t *fdh, int epoll_flags) {
     int rv;
 
     /* Unwatch the other fdh */
-    if (fdh == &client->fdh_socket) {
-        try(rv, fdh_ensure_unwatched(&client->fdh_event));
-    } else {
-        try(rv, fdh_ensure_unwatched(&client->fdh_socket));
-    }
+    if (fdh != &client->fdh_socket) try(rv, fdh_ensure_unwatched(&client->fdh_socket));
+    if (fdh != &client->fdh_event)  try(rv, fdh_ensure_unwatched(&client->fdh_event));
 
     /* Watch the specified fdh */
-    fdh_set_epoll_flags(fdh, epoll_flags);
-    try(rv, fdh_ensure_watched(fdh));
+    if (fdh) {
+        fdh_set_epoll_flags(fdh, epoll_flags);
+        try(rv, fdh_ensure_watched(fdh));
+    }
 
     /* Set state */
     client->state = state;
