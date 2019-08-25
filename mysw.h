@@ -41,7 +41,6 @@
 #define MYSQLD_COM_INIT_DB                           0x02
 #define MYSQLD_COM_QUIT                              0x01
 
-#define fdh_no_read_write NULL
 #define try(__rv, __call) do { if (((__rv) = (__call)) != MYSW_OK) return (__rv); } while(0)
 
 extern char* opt_addr;
@@ -80,25 +79,22 @@ struct _fdpoll_t {
 
 struct _fdh_t {
     fdpoll_t *fdpoll;
-    #define FDH_TYPE_PROXY    0
-    #define FDH_TYPE_CLIENT   1
-    #define FDH_TYPE_SERVER   2
-    #define FDH_TYPE_TARGETER 3
-    #define FDH_TYPE_POOL     4
-    int type;
     void *udata;
-    int idata;
+    #define FDH_TYPE_SOCKET 0
+    #define FDH_TYPE_EVENT  1
+    int type;
     int fd;
-    int (*fn_read_write)(fdh_t *self);
-    int (*fn_process)(fdh_t *self);
-    buf_t in;
-    buf_t out;
-    size_t out_cursor;
+    int is_writeable;
+    pthread_spinlock_t *spinlock;
+    int (*fn_process)(fdh_t *);
     #define FDH_STATE_UNWATCHED 0
     #define FDH_STATE_WATCHED   1
-    #define FDH_STATE_RAISED    2
+    #define FDH_STATE_ONESHOT   2
     int state;
-    int epoll_flags;
+    buf_t buf;
+    size_t buf_cursor;
+    int epoll_events;
+    int read_write_skip;
     int read_write_errno;
     int read_eof;
 };
@@ -149,7 +145,8 @@ struct _client_t {
     server_t *target_server;
     cmd_t cmd;
     buf_t cmd_result;
-    fdh_t fdh_socket;
+    fdh_t fdh_socket_in;
+    fdh_t fdh_socket_out;
     fdh_t fdh_event;
     client_t *next_in_pool;
     client_t *next_in_targeter;
@@ -173,7 +170,8 @@ struct _server_t {
     int port;
     int state;
     client_t *target_client;
-    fdh_t fdh_socket;
+    fdh_t fdh_socket_in;
+    fdh_t fdh_socket_out;
     fdh_t fdh_event;
     fdh_t fdh_timer;
 };
@@ -242,21 +240,19 @@ int cmd_deinit(cmd_t *cmd);
 int cmd_process_target(cmd_t *cmd);
 int fdpoll_new(void *udata, fdpoll_t **out_fdpoll);
 int fdpoll_free(fdpoll_t *fdpoll);
-int fdpoll_set_done(fdpoll_t *fdpoll);
 int fdpoll_event_loop(fdpoll_t *fdpoll);
-int fdh_init(fdh_t *fdh, fdpoll_t *fdpoll, int type, void *udata, int fd, int (*fn_read_write)(fdh_t *), int (*fn_process)(fdh_t *));
+int fdh_init(fdh_t *r, fdh_t *w, fdpoll_t *fdpoll, void *udata, pthread_spinlock_t *spinlock, int type, int rfd, int (*fn_process)(fdh_t *));
 int fdh_ensure_watched(fdh_t *fdh);
 int fdh_ensure_unwatched(fdh_t *fdh);
 int fdh_watch(fdh_t *fdh);
 int fdh_unwatch(fdh_t *fdh);
-int fdh_read_write(fdh_t *fdh);
-int fdh_read_u64(fdh_t *fdh);
 int fdh_read(fdh_t *fdh);
+int fdh_read_event(fdh_t *fdh);
+int fdh_read_socket(fdh_t *fdh);
 int fdh_write(fdh_t *fdh);
 int fdh_is_write_finished(fdh_t *fdh);
+int fdh_is_write_unfinished(fdh_t *fdh);
 int fdh_is_writing(fdh_t *fdh);
-int fdh_set_read_write(fdh_t *fdh, int (*fn_read_write)(fdh_t *));
-int fdh_set_epoll_flags(fdh_t *fdh, int epoll_flags);
 int fdh_reset_rw_state(fdh_t *fdh);
 int pool_new(proxy_t *proxy, char *name, pool_t **out_pool);
 int pool_find(proxy_t *proxy, char *name, pool_t **out_pool);
@@ -395,6 +391,26 @@ POOL
                     (dequeue from pool.queue)
                     (find server in pool.free, move to pool.reserved, set server.cmd, write server.eventfd)
                     
+*/
+
+/*
+
+epoll change
+
+always add socket.fd with epollin
+always add event.fd with epollin
+for writing...
+
+write immediately until EAGAIN/EWOULDBLOCK, then add fd with epollout
+
+if something to write
+    write
+    if EAGAIN/EWOULDBLOCK, add fd with epollout
+elif events & epollout and something to write
+    write
+    if finished, del fd
+elif events & epollout and nothing to write
+   del fd
 
 */
 

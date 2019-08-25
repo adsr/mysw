@@ -14,8 +14,7 @@ int targeter_new(proxy_t *proxy, targeter_t **out_targeter) {
     pthread_spin_init(&targeter->spinlock, PTHREAD_PROCESS_PRIVATE);
 
     /* Init application event handle (internal eventfd) */
-    fdh_init(&targeter->fdh_event, proxy->fdpoll, FDH_TYPE_TARGETER, targeter, efd, fdh_read_u64, targeter_process);
-    fdh_set_epoll_flags(&targeter->fdh_event, EPOLLIN);
+    fdh_init(&targeter->fdh_event, NULL, proxy->fdpoll, targeter, &targeter->spinlock, FDH_TYPE_EVENT, efd, targeter_process);
     fdh_ensure_watched(&targeter->fdh_event);
 
     *out_targeter = targeter;

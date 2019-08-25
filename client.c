@@ -7,7 +7,7 @@ static int client_process_send_cmd(client_t *client);
 static int client_process_send_cmd_inner(client_t *client);
 static int client_process_wait_cmd_res(client_t *client);
 static int client_process_recv_cmd_res(client_t *client);
-static int client_set_state(client_t *client, int state, fdh_t *fdh, int epoll_flags);
+static int client_set_state(client_t *client, int state, fdh_t *fdh);
 
 
 int client_new(proxy_t *proxy, int connfd, client_t **out_client) {
@@ -27,13 +27,13 @@ int client_new(proxy_t *proxy, int connfd, client_t **out_client) {
     /* TODO pthread_spin_destroy */
 
     /* Init socket event handle (network io) */
-    fdh_init(&client->fdh_socket, proxy->fdpoll, FDH_TYPE_CLIENT, client, connfd, fdh_read_write, client_process);
+    fdh_init(&client->fdh_socket_in, &client->fdh_socket_out, proxy->fdpoll, client, &client->spinlock, FDH_TYPE_SOCKET, connfd, client_process);
 
     /* Init application event handle (internal eventfd) */
-    fdh_init(&client->fdh_event, proxy->fdpoll, FDH_TYPE_CLIENT, client, efd, fdh_read_u64, client_process);
+    fdh_init(&client->fdh_event, NULL, proxy->fdpoll, client, &client->spinlock, FDH_TYPE_EVENT, efd, client_process);
 
     /* Initially poll for writeable client socket */
-    client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, &client->fdh_socket, EPOLLOUT);
+    client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, &client->fdh_socket_out);
 
     if (out_client) *out_client = client;
 
@@ -45,14 +45,12 @@ int client_process(fdh_t *fdh) {
     client_t *client;
 
     client = fdh->udata;
-    pthread_spin_lock(&client->spinlock);
 
-    if (client->fdh_socket.read_eof || client->fdh_socket.read_write_errno) {
+    if (client->fdh_socket_in.read_eof || client->fdh_socket_in.read_write_errno || client->fdh_socket_out.read_write_errno) {
         /* The client disconnected or there was a read/write error */
         /* TODO mark for destruction instead of destroying */
         /* TODO write async event that loops until refcount==0 to safely destroy the client */
-        client_destroy(client);
-        return MYSW_OK;
+        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL);
     }
 
     switch (client->state) {
@@ -64,8 +62,6 @@ int client_process(fdh_t *fdh) {
         case CLIENT_STATE_RECV_CMD_RES:            rv = client_process_recv_cmd_res(client); break;
         default: fprintf(stderr, "client_process: Invalid client state %d\n", client->state); rv = MYSW_ERR; break;
     }
-
-    pthread_spin_unlock(&client->spinlock);
 
     return rv;
 }
@@ -81,7 +77,7 @@ static int client_process_recv_handshake_init(client_t *client) {
     buf_t *out;
     fdh_t *fdh_socket;
 
-    fdh_socket = &client->fdh_socket;
+    fdh_socket = &client->fdh_socket_out;
 
     if (!fdh_is_writing(fdh_socket)) {
         /* Queue handshake packet */
@@ -99,7 +95,7 @@ static int client_process_recv_handshake_init(client_t *client) {
         /* Build init packet */
         /* TODO support other caps, auth, ssl */
         fdh_reset_rw_state(fdh_socket);
-        out = &fdh_socket->out;
+        out = &fdh_socket->buf;
         buf_clear(out);
         buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
         buf_append_u8(out, '\x00');                             /* sequence id (1) */
@@ -121,11 +117,11 @@ static int client_process_recv_handshake_init(client_t *client) {
 
     if (fdh_is_write_finished(fdh_socket)) {
         /* Finished writing; transition state */
-        return client_set_state(client, CLIENT_STATE_SEND_HANDSHAKE_INIT_RES, &client->fdh_socket, EPOLLIN);
+        return client_set_state(client, CLIENT_STATE_SEND_HANDSHAKE_INIT_RES, &client->fdh_socket_in);
     }
 
     /* Not yet finished writing; re-arm */
-    return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, &client->fdh_socket, EPOLLOUT);
+    return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, &client->fdh_socket_out);
 }
 
 /* The client finished receiving the handshake packet. We now expect the client
@@ -144,11 +140,11 @@ static int client_process_send_handshake_init_res(client_t *client) {
     char *username, *auth, *dbname, *plugin;
     size_t username_len, auth_len, dbname_len, plugin_len;
 
-    in = &client->fdh_socket.in;
+    in = &client->fdh_socket_in.buf;
 
     if (!util_has_complete_mysql_packet(in)) {
         /* Have not received a complete packet yet; re-arm */
-        return client_set_state(client, CLIENT_STATE_SEND_HANDSHAKE_INIT_RES, &client->fdh_socket, EPOLLIN);
+        return client_set_state(client, CLIENT_STATE_SEND_HANDSHAKE_INIT_RES, &client->fdh_socket_in);
     }
 
     /* We have a complete packet; parse and respond */
@@ -192,8 +188,8 @@ static int client_process_send_handshake_init_res(client_t *client) {
     (void)payload_len;
 
     /* Queue OK packet */
-    fdh_reset_rw_state(&client->fdh_socket);
-    out = &client->fdh_socket.out;
+    fdh_reset_rw_state(&client->fdh_socket_out);
+    out = &client->fdh_socket_out.buf;
     server_status_flags = MYSQLD_SERVER_STATUS_AUTOCOMMIT; /* TODO figure out init server_status_flags */
     buf_clear(out);
     buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
@@ -206,35 +202,36 @@ static int client_process_send_handshake_init_res(client_t *client) {
     buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
 
     /* Transition state */
-    return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket, EPOLLOUT);
+    return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket_out);
 }
 
 static int client_process_recv_handshake_res(client_t *client) {
-    if (!fdh_is_write_finished(&client->fdh_socket)) {
+    if (!fdh_is_write_finished(&client->fdh_socket_out)) {
         /* We have not finished writing to the client; re-arm */
-        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket, EPOLLOUT);
+        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket_out);
     }
 
     /* We have finished writing to the client; transition state */
-    return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket, EPOLLIN);
+    fdh_reset_rw_state(&client->fdh_socket_in);
+    return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket_in);
 }
 
 
 static int client_process_send_cmd(client_t *client) {
     buf_t *in;
 
-    in = &client->fdh_socket.in;
+    in = &client->fdh_socket_in.buf;
 
     if (!util_has_complete_mysql_packet(in)) {
         /* Client has not sent a complete packet yet; re-arm */
-        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket, EPOLLIN);
+        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket_in);
     }
 
     cmd_init(client, in, &client->cmd);
 
     if (client->cmd.cmd_byte == MYSQLD_COM_QUIT) {
         /* TODO client destroy */
-        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL, 0);
+        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL);
     }
 
     return client_process_send_cmd_inner(client);
@@ -257,21 +254,21 @@ static int client_process_send_cmd_inner(client_t *client) {
         pool_wakeup(client->target_pool);
     }
 
-    return client_set_state(client, CLIENT_STATE_WAIT_CMD_RES, &client->fdh_event, EPOLLIN);
+    return client_set_state(client, CLIENT_STATE_WAIT_CMD_RES, &client->fdh_event);
 }
 
 static int client_process_wait_cmd_res(client_t *client) {
     fdh_t *fdh_socket;
     buf_t *out;
 
-    fdh_socket = &client->fdh_socket;
-    out = &fdh_socket->out;
+    fdh_socket = &client->fdh_socket_out;
+    out = &fdh_socket->buf;
 
     fdh_reset_rw_state(fdh_socket);
     buf_copy_from(out, &client->cmd_result);
     buf_clear(&client->cmd_result);
 
-    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket, EPOLLOUT);
+    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket_out);
 
     /* TODO mult statements
     
@@ -290,24 +287,27 @@ static int client_process_wait_cmd_res(client_t *client) {
 static int client_process_recv_cmd_res(client_t *client) {
     fdh_t *fdh_socket;
 
-    fdh_socket = &client->fdh_socket;
+    fdh_socket = &client->fdh_socket_out;
 
     if (fdh_is_write_finished(fdh_socket)) {
         /* Finished writing; transition state */
-        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket, EPOLLIN);
+        fdh_reset_rw_state(&client->fdh_socket_in);
+        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket_in);
     }
 
     /* Not yet finished writing; re-arm */
-    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket, EPOLLOUT);
+    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket_out);
 }
 
 int client_destroy(client_t *client) {
-    fdh_ensure_unwatched(&client->fdh_socket);
+    fdh_ensure_unwatched(&client->fdh_socket_in);
+    fdh_ensure_unwatched(&client->fdh_socket_out);
     fdh_ensure_unwatched(&client->fdh_event);
-    close(client->fdh_socket.fd);
+    close(client->fdh_socket_in.fd);
+    close(client->fdh_socket_out.fd);
     close(client->fdh_event.fd);
-    buf_free(&client->fdh_socket.in);
-    buf_free(&client->fdh_socket.out);
+    buf_free(&client->fdh_socket_in.buf);
+    buf_free(&client->fdh_socket_out.buf);
     /* TODO avoid use after free, e.g., other objects may have client pointer */
     free(client);
     return MYSW_OK;
@@ -319,18 +319,15 @@ int client_wakeup(client_t *client) {
     return (write(client->fdh_event.fd, &i, sizeof(i)) == sizeof(i)) ? MYSW_OK : MYSW_ERR;
 }
 
-static int client_set_state(client_t *client, int state, fdh_t *fdh, int epoll_flags) {
+static int client_set_state(client_t *client, int state, fdh_t *fdh) {
     int rv;
 
-    /* Unwatch the other fdh */
-    if (fdh != &client->fdh_socket) try(rv, fdh_ensure_unwatched(&client->fdh_socket));
-    if (fdh != &client->fdh_event)  try(rv, fdh_ensure_unwatched(&client->fdh_event));
+    if (fdh != &client->fdh_socket_in)  fdh_ensure_unwatched(&client->fdh_socket_in);
+    if (fdh != &client->fdh_socket_out) fdh_ensure_unwatched(&client->fdh_socket_out);
+    if (fdh != &client->fdh_event)      fdh_ensure_unwatched(&client->fdh_event);
 
     /* Watch the specified fdh */
-    if (fdh) {
-        fdh_set_epoll_flags(fdh, epoll_flags);
-        try(rv, fdh_ensure_watched(fdh));
-    }
+    if (fdh) try(rv, fdh_ensure_watched(fdh));
 
     /* Set state */
     client->state = state;

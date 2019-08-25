@@ -3,7 +3,7 @@
 char* opt_addr = NULL;
 int opt_port = 3307;
 int opt_backlog = 16;
-int opt_num_threads = 1; /* TODO saner default */
+int opt_num_threads = 2; /* TODO saner default */
 int opt_epoll_max_events = 256;
 int opt_epoll_timeout_ms = 1000;
 int opt_read_size = 256;
@@ -79,8 +79,7 @@ int main(int argc, char **argv) {
     targeter_new(proxy, &proxy->targeter);
 
     /* Add listener socket to event loop */
-    fdh_init(&proxy->fdh_listen, proxy->fdpoll, FDH_TYPE_PROXY, proxy, listenfd, fdh_no_read_write, worker_accept_conn);
-    fdh_set_epoll_flags(&proxy->fdh_listen, EPOLLIN);
+    fdh_init(&proxy->fdh_listen, NULL, proxy->fdpoll, proxy, NULL, FDH_TYPE_SOCKET, listenfd, worker_accept_conn);
     if (fdh_watch(&proxy->fdh_listen) != MYSW_OK) {
         goto main_error;
     }
@@ -105,7 +104,7 @@ int main(int argc, char **argv) {
     goto main_done;
 
 main_error:
-    if (proxy->fdpoll) fdpoll_set_done(proxy->fdpoll);
+    if (proxy->fdpoll) proxy->fdpoll->done = 1;
 
 main_done:
     /* TODO destroy clients, servers */
@@ -158,7 +157,7 @@ static void *signal_main(void *arg) {
     rv = read(done_pipe[0], &signum, sizeof(int));
 
     /* End event loop */
-    fdpoll_set_done(proxy->fdpoll);
+    proxy->fdpoll->done = 1;
     /* TODO broadcast all conditions */
 
     return NULL;
