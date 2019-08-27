@@ -38,6 +38,8 @@
 #define MYSQLD_ERR                                   0xff
 #define MYSQLD_COM_QUERY                             0x03
 #define MYSQLD_COM_STMT_PREPARE                      0x16
+#define MYSQLD_COM_STMT_SEND_LONG_DATA               0x18
+#define MYSQLD_COM_STMT_CLOSE                        0x19
 #define MYSQLD_COM_INIT_DB                           0x02
 #define MYSQLD_COM_QUIT                              0x01
 
@@ -118,14 +120,29 @@ struct _worker_t {
 
 struct _cmd_t {
     client_t *client;
-    int is_target_cmd;
-    int state;
     uint8_t cmd_byte;
     buf_t *payload;
     char *sql;
     size_t sql_len;
     stmt_t *stmt_list;
     stmt_t *stmt_cur;
+    stmt_t *stmt_parsing;
+};
+
+struct _stmt_t {
+    #define STMT_TOKEN_COMMENT  0
+    #define STMT_TOKEN_STRING   1
+    #define STMT_TOKEN_BACKTICK 2
+    #define STMT_TOKEN_WORD     3
+    char *sql;
+    size_t sql_len;
+    char *comment;
+    size_t comment_len;
+    char *first;
+    size_t first_len;
+    char *second;
+    size_t second_len;
+    stmt_t *next;
 };
 
 struct _client_t {
@@ -196,17 +213,7 @@ struct _targeter_t {
     fdh_t fdh_event;
 };
 
-struct _stmt_t {
-    char *leading_comment;
-    size_t leading_comment_len;
-    char *token1;
-    size_t token1_len;
-    char *token2;
-    size_t token2_len;
-    stmt_t *next;
-};
-
-/* adam@asx1c5:~/mysw$ grep -Ph '^\S+ \*?[a-z]+_[^\(]+\(' *.c  | sed 's@ {@;@g' */
+/* grep -Ph '^\S+ \*?[a-z]+_[^\(]+\(' *.c  | sed 's@ {@;@g' */
 int buf_append_str_len(buf_t *buf, char *str, size_t len);
 int buf_append_u8(buf_t *buf, uint8_t i);
 int buf_append_u8_repeat(buf_t *buf, uint8_t i, int repeat);
@@ -235,7 +242,11 @@ int client_process(fdh_t *fdh);
 int client_destroy(client_t *client);
 int client_wakeup(client_t *client);
 int cmd_init(client_t *client, buf_t *in, cmd_t *cmd);
-int cmd_parse_sql(cmd_t *cmd);
+int cmd_lex_sql(buf_t *in, cmd_t *cmd);
+int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t end);
+int cmd_lex_sql_end_stmt(cmd_t *cmd, size_t *start, size_t end);
+int cmd_is_targeting(cmd_t *cmd);
+int cmd_is_use_stmt(cmd_t *cmd);
 int cmd_deinit(cmd_t *cmd);
 int cmd_process_target(cmd_t *cmd);
 int fdpoll_new(void *udata, fdpoll_t **out_fdpoll);
@@ -286,7 +297,8 @@ int worker_join(worker_t *worker);
 int worker_deinit(worker_t *worker);
 int worker_accept_conn(fdh_t *fdh);
 
-extern server_t *the_server;
+extern server_t *server_a;
+extern server_t *server_b;
 
 /* https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html */
 
@@ -313,7 +325,7 @@ end
 function get_target(in, out)
   in["sql"]
   in["sql_command"]
-  in["sql_leading_comment"]
+  in["sql_comment"]
   in["db_name"]
   in["client_user"]
   in["client_ip"]
@@ -325,7 +337,7 @@ function get_target(in, out)
       out["db_name"] = target["db_name"]
       return OK
     elseif
-    index_table, shard_column, shardifier_column, shardifier_val = parse_leading_comment(in["leading_comment"])
+    index_table, shard_column, shardifier_column, shardifier_val = parse_comment(in["comment"])
     out["request:shard"] = "db:shardpile_001:select shop_shard from shop_index where shop_id = hard"
     return OK
   end

@@ -7,7 +7,8 @@ int opt_num_threads = 2; /* TODO saner default */
 int opt_epoll_max_events = 256;
 int opt_epoll_timeout_ms = 1000;
 int opt_read_size = 256;
-server_t *the_server = NULL;
+server_t *server_a = NULL;
+server_t *server_b = NULL;
 
 static void *signal_main(void *arg);
 static void signal_handle(int signum);
@@ -89,7 +90,11 @@ int main(int argc, char **argv) {
     /* TODO server pools */
     server_new(proxy, "127.0.0.1", 3306, &server);
     server_process_connect(server);
-    the_server = server;
+    server_a = server;
+
+    server_new(proxy, "127.0.0.1", 3316, &server);
+    server_process_connect(server);
+    server_b = server;
 
     /* Create worker threads */
     for (i = 0; i < opt_num_threads; ++i) {

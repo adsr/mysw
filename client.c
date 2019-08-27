@@ -244,44 +244,42 @@ static int client_process_send_cmd_inner(client_t *client) {
         /* TODO assert target_server is reserved for us */
         server_set_client(client->target_server, client);
         server_wakeup(client->target_server);
-    } else if (!client->target_pool || client->cmd.is_target_cmd) {
+    } else if (!client->target_pool || cmd_is_targeting(&client->cmd)) {
         /* Need to target */
         targeter_queue_client(client->proxy->targeter, client);
         targeter_wakeup(client->proxy->targeter);
-    } else {
-        /* Use existing target (client->target_pool) */
+    } else if (client->target_pool) {
+        /* Use existing target */
         pool_queue_client(client->target_pool, client);
         pool_wakeup(client->target_pool);
+    } else {
+        /* Cannot target */
+        /* TODO error */
     }
 
     return client_set_state(client, CLIENT_STATE_WAIT_CMD_RES, &client->fdh_event);
 }
 
 static int client_process_wait_cmd_res(client_t *client) {
-    fdh_t *fdh_socket;
-    buf_t *out;
+    cmd_t *cmd;
 
-    fdh_socket = &client->fdh_socket_out;
-    out = &fdh_socket->buf;
+    cmd = &client->cmd;
 
-    fdh_reset_rw_state(fdh_socket);
-    buf_copy_from(out, &client->cmd_result);
-    buf_clear(&client->cmd_result);
-
-    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket_out);
-
-    /* TODO mult statements
-    
-    if (!client->cmd.stmt_cur->next) {
-        |* No more stmts. Time to send results.*|
-        return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_event, EPOLLOUT);
+    if (cmd->cmd_byte == MYSQLD_COM_STMT_SEND_LONG_DATA || cmd->cmd_byte == MYSQLD_COM_STMT_CLOSE) {
+        /* No response is sent back to the client for these commands */
+        fdh_reset_rw_state(&client->fdh_socket_in);
+        return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket_in);
+    } else if (cmd->cmd_byte == MYSQLD_COM_QUERY && cmd->stmt_cur->next) {
+        /* Process next stmt in multi-stmt cmd */
+        cmd->stmt_cur = cmd->stmt_cur->next;
+        return client_process_send_cmd_inner(client);
     }
 
-    |* Process next stmt in cmd *|
-    client->cmd.stmt_cur = client->cmd.stmt_cur->next;
-    return client_process_send_cmd_inner(client);
-
-    */
+    /* Time to send results. */
+    fdh_reset_rw_state(&client->fdh_socket_out);
+    buf_copy_from(&client->fdh_socket_out.buf, &client->cmd_result);
+    buf_clear(&client->cmd_result);
+    return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket_out);
 }
 
 static int client_process_recv_cmd_res(client_t *client) {
@@ -335,36 +333,6 @@ static int client_set_state(client_t *client, int state, fdh_t *fdh) {
 }
 
 /*
-
-static int client_process_command_executing(client_t *client) {
-    stmt_t *stmt;
-
-    stmt = client->stmt_list;
-    if (!stmt) {
-        client->state = CLIENT_STATE_COMMAND_READY;
-        client->fdh_socket.
-        fdh_watch(&client->fdh_socket); // TODO handle connection error (retry later?)
-    }
-    while (stmt) {
-        if (strncasecmp("use", stmt->cmd, stmt->cmd_len) == 0) {
-            
-        }
-        stmt = stmt->next;
-    }
-
-    /* TODO parse out USE statement, retarget, forward */
-    /* TODO prevent retarget in transaction */
-    /* TODO foreach stmt:
-     *        if use: set db
-     *        ask user-script where to go (array for teeing, empty for blackhole)
-     *        queue command on target
-     *        target moves into reserved state (rwlock)
-     *        wakeup target via eventfd write
-     *        target wakes up and dequeues command
-     *        
-    /* TODO queue command on target pool or specific server (rwlock) */
-    /* TODO wakeup pool or specific server (eventfd)
-
 
 0000: 5300 0000 0a35 2e36 2e34 312d 3834 2e31 2d6c 6f67 0012 fc7c 0036 2d7c 4c45 5456  S....5.6.41-84.1-log...|.6-|LETV
 0020: 3300 fff7 2102 007f 8015 0000 0000 0000 0000 0000 3c72 4d69 4767 4f38 6a2d 3d2d  3...!...............<rMiGgO8j-=-

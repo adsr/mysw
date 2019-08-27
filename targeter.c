@@ -24,6 +24,7 @@ int targeter_new(proxy_t *proxy, targeter_t **out_targeter) {
 int targeter_process(fdh_t *fdh) {
     targeter_t *targeter;
     client_t *client;
+    cmd_t *cmd;
 
     targeter = fdh->udata;
 
@@ -31,20 +32,22 @@ int targeter_process(fdh_t *fdh) {
         return MYSW_OK;
     }
 
+    /* TODO lock */
     client = targeter->client_queue;
     LL_DELETE2(targeter->client_queue, client, next_in_targeter);
 
     /* TODO actual targeting */
+    cmd = &client->cmd;
+    client->target_server = server_a;
+    server_a->target_client = client;
 
-    client->target_server = the_server;
-    the_server->target_client = client;
-
-    server_wakeup(the_server);
+    server_wakeup(server_a);
 
     return MYSW_OK;
 }
 
 int targeter_queue_client(targeter_t *targeter, client_t *client) {
+    /* TODO lock */
     LL_APPEND2(targeter->client_queue, client, next_in_targeter);
     return MYSW_OK;
 }

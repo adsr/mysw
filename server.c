@@ -316,6 +316,8 @@ int server_process_send_cmd_res(server_t *server) {
         return MYSW_OK;
     }
 
+    /* TODO check status flags for in_txn, in_prep_stmt */
+
     buf_copy_from(&server->target_client->cmd_result, in);
     client_wakeup(server->target_client);
 
