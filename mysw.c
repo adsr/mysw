@@ -1,12 +1,13 @@
 #include "mysw.h"
 
-char* opt_addr = NULL;
+char *opt_addr = NULL;
 int opt_port = 3307;
 int opt_backlog = 16;
 int opt_num_threads = 2; /* TODO saner default */
 int opt_epoll_max_events = 256;
 int opt_epoll_timeout_ms = 1000;
 int opt_read_size = 256;
+char *opt_targeter_socket_path = "/tmp/mysw.sock";
 server_t *server_a = NULL;
 server_t *server_b = NULL;
 
@@ -22,6 +23,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr;
     proxy_t *proxy;
     server_t *server;
+    pool_t *pool;
 
     (void)argc;
     (void)argv;
@@ -33,6 +35,7 @@ int main(int argc, char **argv) {
 
     /* Init proxy global */
     proxy = calloc(1, sizeof(proxy_t));
+    pthread_spin_init(&proxy->spinlock_pool_map, PTHREAD_PROCESS_PRIVATE);
 
     /* Init workers */
     proxy->workers = calloc(opt_num_threads, sizeof(worker_t));
@@ -88,11 +91,13 @@ int main(int argc, char **argv) {
     /* Connect to local mysqld */
     /* TODO let user-script do this */
     /* TODO server pools */
-    server_new(proxy, "127.0.0.1", 3306, &server);
+    pool_new(proxy, "pools_open", &pool);
+
+    server_new(proxy, pool, "127.0.0.1", 3306, &server);
     server_process_connect(server);
     server_a = server;
 
-    server_new(proxy, "127.0.0.1", 3316, &server);
+    server_new(proxy, pool, "127.0.0.1", 3316, &server);
     server_process_connect(server);
     server_b = server;
 

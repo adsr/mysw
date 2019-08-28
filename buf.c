@@ -4,6 +4,10 @@ int buf_append_str_len(buf_t *buf, char *str, size_t len) {
     return buf_append_void(buf, str, len);
 }
 
+int buf_append_str(buf_t *buf, char *str) {
+    return buf_append_str_len(buf, str, strlen(str));
+}
+
 int buf_append_u8(buf_t *buf, uint8_t i) {
     return buf_append_void(buf, &i, sizeof(i));
 }
@@ -21,7 +25,15 @@ int buf_append_u16(buf_t *buf, uint16_t i) {
     return buf_append_void(buf, &i, sizeof(i));
 }
 
+int buf_append_u24(buf_t *buf, uint32_t i) {
+    return buf_append_void(buf, &i, 3);
+}
+
 int buf_append_u32(buf_t *buf, uint32_t i) {
+    return buf_append_void(buf, &i, sizeof(i));
+}
+
+int buf_append_u64(buf_t *buf, uint64_t i) {
     return buf_append_void(buf, &i, sizeof(i));
 }
 
@@ -31,9 +43,12 @@ int buf_clear(buf_t *buf) {
 }
 
 int buf_ensure_cap(buf_t *buf, size_t cap) {
-    if (cap > buf->cap) {
-        buf->data = realloc(buf->data, cap);
-        buf->cap = cap;
+    size_t min_alloc;
+    if (buf->cap < cap) {
+        if (buf->cap < 16)  buf->cap = 16;
+        buf->cap *= 2;
+        if (buf->cap < cap) buf->cap = cap;
+        buf->data = realloc(buf->data, buf->cap);
     }
     return MYSW_OK;
 }
@@ -128,12 +143,23 @@ uint32_t buf_get_u32(buf_t *buf, size_t pos) {
     return i;
 }
 
+uint64_t buf_get_u64(buf_t *buf, size_t pos) {
+    uint64_t i;
+    i = 0;
+    buf_copy_to(buf, pos, &i, sizeof(i));
+    return i;
+}
+
 int buf_len(buf_t *buf) {
     return buf->len;
 }
 
 int buf_set_u24(buf_t *buf, size_t pos, uint32_t i) {
     return buf_set_void(buf, pos, &i, 3);
+}
+
+int buf_set_u32(buf_t *buf, size_t pos, uint32_t i) {
+    return buf_set_void(buf, pos, &i, sizeof(i));
 }
 
 int buf_set_void(buf_t *buf, size_t pos, void *data, size_t len) {
@@ -144,10 +170,39 @@ int buf_set_void(buf_t *buf, size_t pos, void *data, size_t len) {
     return MYSW_OK;
 }
 
+int buf_append_buf(buf_t *buf, buf_t *other) {
+    return buf_append_void(buf, other->data, other->len);
+}
+
 int buf_append_void(buf_t *buf, void *data, size_t len) {
     buf_ensure_cap(buf, buf->len + len + 1);
     memcpy(buf->data + buf->len, data, len);
     buf->len += len;
     *(buf->data + buf->len) = '\0';
     return MYSW_OK;
+}
+
+int buf_assign_str_len(buf_t *buf, char *str, size_t len) {
+    buf_clear(buf);
+    return buf_append_str_len(buf, str, len);
+}
+
+uint64_t buf_get_int_lenenc(buf_t *buf, size_t pos, int *len) {
+    uint8_t a;
+    a = buf_get_u8(buf, pos);
+    if (a < 0xfb) {
+        *len = 1;
+        return a;
+    } else if (a == 0xfc) {
+        *len = 3;
+        return buf_get_u16(buf, pos + 1);
+    } else if (a == 0xfd) {
+        *len = 4;
+        return buf_get_u24(buf, pos + 1);
+    } else if (a == 0xfe) {
+        *len = 9;
+        return buf_get_u64(buf, pos + 1);
+    }
+    *len = 0; /* TODO invalid lenenc int */
+    return 0;
 }

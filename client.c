@@ -48,8 +48,11 @@ int client_process(fdh_t *fdh) {
 
     if (client->fdh_socket_in.read_eof || client->fdh_socket_in.read_write_errno || client->fdh_socket_out.read_write_errno) {
         /* The client disconnected or there was a read/write error */
-        /* TODO mark for destruction instead of destroying */
-        /* TODO write async event that loops until refcount==0 to safely destroy the client */
+        if (client->target_server) {
+            /* TODO assert client->target_server->in_reserved */
+            pool_server_move_to_free(client->target_server->pool, client->target_server);
+        }
+        /* TODO refcounting for destroying objects */
         return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL);
     }
 
@@ -97,7 +100,7 @@ static int client_process_recv_handshake_init(client_t *client) {
         fdh_reset_rw_state(fdh_socket);
         out = &fdh_socket->buf;
         buf_clear(out);
-        buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
+        buf_append_u24(out, 0);                                 /* payload len (3) (set below) */
         buf_append_u8(out, '\x00');                             /* sequence id (1) */
         buf_append_u8(out, '\x0a');                             /* protocol version */
         buf_append_str_len(out, "derp\x00", 5);                 /* TODO server version */
@@ -129,16 +132,15 @@ static int client_process_recv_handshake_init(client_t *client) {
  * packet, and the connection moves into the command phase.
  */
 static int client_process_send_handshake_init_res(client_t *client) {
-    buf_t *in, *out;
+    buf_t *in;
     size_t cur;
     int capability_flags;
     int max_packet_size;
-    int server_status_flags;
     int charset;
     uint8_t sequence_id;
     int payload_len;
-    char *username, *auth, *dbname, *plugin;
-    size_t username_len, auth_len, dbname_len, plugin_len;
+    char *username, *auth, *db_name, *plugin;
+    size_t username_len, auth_len, db_name_len, plugin_len;
 
     in = &client->fdh_socket_in.buf;
 
@@ -157,6 +159,7 @@ static int client_process_send_handshake_init_res(client_t *client) {
     charset = buf_get_u8(in, cur);                      cur += 1;
     cur += 23; /* filler */
     username = buf_get_str0(in, cur, &username_len);    cur += username_len + 1;
+    buf_assign_str_len(&client->username, username, username_len);
     if (capability_flags & MYSQLD_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
         auth_len = buf_get_u8(in, cur);                 cur += 1;
         auth = buf_get_str(in, cur);                    cur += auth_len;
@@ -165,8 +168,8 @@ static int client_process_send_handshake_init_res(client_t *client) {
         auth = buf_get_str0(in, cur, &auth_len);        cur += auth_len;
     }
     if (capability_flags & MYSQLD_CLIENT_CONNECT_WITH_DB) {
-        dbname = buf_get_str0(in, cur, &dbname_len);    cur += dbname_len + 1;
-        /* TODO remember dbname */
+        db_name = buf_get_str0(in, cur, &db_name_len);  cur += db_name_len + 1;
+        buf_assign_str_len(&client->db_name, db_name, db_name_len);
     }
     if (capability_flags & MYSQLD_CLIENT_PLUGIN_AUTH) {
         plugin = buf_get_str0(in, cur, &plugin_len);    cur += plugin_len + 1;
@@ -181,25 +184,16 @@ static int client_process_send_handshake_init_res(client_t *client) {
     /* TODO queue ERR packet if failed auth */
     (void)username;
     (void)auth;
-    (void)dbname;
+    (void)db_name;
     (void)plugin;
     (void)charset;
     (void)max_packet_size;
     (void)payload_len;
 
     /* Queue OK packet */
-    fdh_reset_rw_state(&client->fdh_socket_out);
-    out = &client->fdh_socket_out.buf;
-    server_status_flags = MYSQLD_SERVER_STATUS_AUTOCOMMIT; /* TODO figure out init server_status_flags */
-    buf_clear(out);
-    buf_append_str_len(out, "\x00\x00\x00", 3);             /* payload len (3) (set below) */
-    buf_append_u8(out, sequence_id + 1);                    /* sequence id (1) */
-    buf_append_u8(out, '\x00');                             /* OK packet header */
-    buf_append_u8(out, '\x00');                             /* affected rows (lenenc) */
-    buf_append_u8(out, '\x00');                             /* last insert id (lenenc) */
-    buf_append_u16(out, server_status_flags);               /* server status flags (2) */
-    buf_append_u16(out, 0);                                 /* warnings (2) */
-    buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
+    client->status_flags = MYSQLD_SERVER_STATUS_AUTOCOMMIT;
+    client->last_sequence_id = sequence_id;
+    client_write_ok_packet(client);
 
     /* Transition state */
     return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_RES, &client->fdh_socket_out);
@@ -227,34 +221,85 @@ static int client_process_send_cmd(client_t *client) {
         return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket_in);
     }
 
+    client->last_sequence_id = buf_get_u8(in, 3);
     cmd_init(client, in, &client->cmd);
 
-    if (client->cmd.cmd_byte == MYSQLD_COM_QUIT) {
-        /* TODO client destroy */
-        return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL);
+    client->request_id = 1; /* TODO random number or atomic incr */
+
+    switch (client->cmd.cmd_byte) {
+        case MYSQLD_COM_QUIT:
+            /* TODO client destroy */
+            return client_set_state(client, CLIENT_STATE_RECV_HANDSHAKE_INIT, NULL);
+        case MYSQLD_COM_STMT_PREPARE:
+            client->prep_stmt_count += 1;
+            break;
+        case MYSQLD_COM_STMT_CLOSE:
+            client->prep_stmt_count -= 1;
+            break;
+        case MYSQLD_COM_INIT_DB:
+            client_set_db_name(client, in->data + 5, in->len - 5);
+            client_write_ok_packet(client);
+            return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket_out);
     }
 
     return client_process_send_cmd_inner(client);
 }
 
+int client_write_ok_packet(client_t *client) {
+    buf_t *out;
+
+    /* Queue OK packet */
+    fdh_reset_rw_state(&client->fdh_socket_out);
+    out = &client->fdh_socket_out.buf;
+    buf_clear(out);
+    buf_append_u24(out, 0);                                 /* payload len (3) (set below) */
+    buf_append_u8(out, client->last_sequence_id + 1);       /* sequence id (1) */
+    buf_append_u8(out, '\x00');                             /* OK packet header */
+    buf_append_u8(out, '\x00');                             /* affected rows (lenenc) */
+    buf_append_u8(out, '\x00');                             /* last insert id (lenenc) */
+    buf_append_u16(out, client->status_flags);              /* server status flags (2) */
+    buf_append_u16(out, 0);                                 /* warnings (2) */
+    buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
+    return MYSW_OK;
+}
+
+int client_write_err_packet(client_t *client, const char *err_fmt, ...) {
+    buf_t *out;
+    char err[1024];
+    va_list vl;
+
+    va_start(vl, err_fmt);
+    vsnprintf(err, sizeof(err), err_fmt, vl);
+    va_end(vl);
+
+    /* Queue ERR packet */
+    fdh_reset_rw_state(&client->fdh_socket_out);
+    out = &client->fdh_socket_out.buf;
+    buf_clear(out);
+    buf_append_u24(out, 0);                                 /* payload len (3) (set below) */
+    buf_append_u8(out, client->last_sequence_id + 1);       /* sequence id (1) */
+    buf_append_u8(out, '\xff');                             /* ERR packet header */
+    buf_append_u16(out, 0);                                 /* error code (2) */
+    buf_append_u8(out, '#');                                /* sql_state_marker (1) */
+    buf_append_str_len(out, "HY000", 5);                    /* sql_state (5) */
+    buf_append_str(out, err);                               /* error message (eof) */
+    buf_set_u24(out, 0, buf_len(out) - 4);                  /* set payload len */
+    return MYSW_OK;
+}
+
 static int client_process_send_cmd_inner(client_t *client) {
-    if (client->in_txn || client->in_prep_stmt) {
-        /* Need specific mysqld */
-        /* TODO assert target_server is present*/
-        /* TODO assert target_server is reserved for us */
-        server_set_client(client->target_server, client);
+    if (client->target_server) {
+        /* Already have a reserved mysqld */
+        /* TODO assert client->target_server->in_reserved */
+        /* TODO assert client->target_server->in_txn || client->prep_stmt_count > 0 */
         server_wakeup(client->target_server);
     } else if (!client->target_pool || cmd_is_targeting(&client->cmd)) {
         /* Need to target */
         targeter_queue_client(client->proxy->targeter, client);
-        targeter_wakeup(client->proxy->targeter);
-    } else if (client->target_pool) {
-        /* Use existing target */
+    } else {
+        /* Use existing target_pool */
         pool_queue_client(client->target_pool, client);
         pool_wakeup(client->target_pool);
-    } else {
-        /* Cannot target */
-        /* TODO error */
     }
 
     return client_set_state(client, CLIENT_STATE_WAIT_CMD_RES, &client->fdh_event);
@@ -265,12 +310,13 @@ static int client_process_wait_cmd_res(client_t *client) {
 
     cmd = &client->cmd;
 
-    if (cmd->cmd_byte == MYSQLD_COM_STMT_SEND_LONG_DATA || cmd->cmd_byte == MYSQLD_COM_STMT_CLOSE) {
-        /* No response is sent back to the client for these commands */
+    if (!cmd_expects_response(cmd)) {
+        /* No response is sent back to the client for this cmd */
         fdh_reset_rw_state(&client->fdh_socket_in);
         return client_set_state(client, CLIENT_STATE_SEND_CMD, &client->fdh_socket_in);
     } else if (cmd->cmd_byte == MYSQLD_COM_QUERY && cmd->stmt_cur->next) {
         /* Process next stmt in multi-stmt cmd */
+        /* TODO assert server sent MYSQLD_SERVER_MORE_RESULTS_EXISTS */
         cmd->stmt_cur = cmd->stmt_cur->next;
         return client_process_send_cmd_inner(client);
     }
@@ -315,6 +361,18 @@ int client_wakeup(client_t *client) {
     uint64_t i;
     i = 1;
     return (write(client->fdh_event.fd, &i, sizeof(i)) == sizeof(i)) ? MYSW_OK : MYSW_ERR;
+}
+
+int client_set_db_name(client_t *client, char *db_name, size_t db_name_len) {
+    buf_clear(&client->db_name);
+    buf_append_str_len(&client->db_name, db_name, db_name_len);
+    return MYSW_OK;
+}
+
+int client_set_hint(client_t *client, char *hint, size_t hint_len) {
+    buf_clear(&client->hint);
+    buf_append_str_len(&client->hint, hint, hint_len);
+    return MYSW_OK;
 }
 
 static int client_set_state(client_t *client, int state, fdh_t *fdh) {

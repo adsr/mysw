@@ -2,7 +2,7 @@
 
 static int server_set_state(server_t *server, int state, fdh_t *fdh);
 
-int server_new(proxy_t *proxy, char *host, int port, server_t **out_server) {
+int server_new(proxy_t *proxy, pool_t *pool, char *host, int port, server_t **out_server) {
     server_t *server;
     int efd, tfd;
 
@@ -21,6 +21,7 @@ int server_new(proxy_t *proxy, char *host, int port, server_t **out_server) {
     /* TODO pthread_spin_destroy */
 
     server->proxy = proxy;
+    server->pool = pool;
     server->fdh_socket_in.fd = -1;
     server->host = strdup(host);
     server->port = port;
@@ -44,11 +45,8 @@ int server_process(fdh_t *fdh) {
     server = fdh->udata;
 
     if (server->fdh_socket_in.read_eof || server->fdh_socket_in.read_write_errno) {
-        /* The server disconnected or there was a read/write error */
-        /* TODO mark for destruction instead of destroying */
-        /* TODO write async event that loops until refcount==0 to safely destroy the server */
-        /* TODO server_destroy(server); */
-        return server_set_state(server, SERVER_STATE_DISCONNECTED, NULL);
+        pool_server_move_to_dead(server->pool, server);
+        return server_set_state(server, SERVER_STATE_DISCONNECTED, NULL); /* TODO reconnect */
     }
 
     switch (server->state) {
@@ -93,7 +91,7 @@ int server_process_connect(server_t *server) {
 
     /* Make socket */
     if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("server_process_connecting: socket");
+        perror("server_process_connect: socket");
         return MYSW_ERR;
     }
 
@@ -102,7 +100,7 @@ int server_process_connect(server_t *server) {
 
     /* Set non-blocking mode */
     if ((sock_flags = fcntl(sockfd, F_GETFL, 0)) < 0 || fcntl(sockfd, F_SETFL, sock_flags | O_NONBLOCK) < 0) {
-        perror("server_process_connecting: fcntl");
+        perror("server_process_connect: fcntl");
         close(sockfd);
         return MYSW_ERR;
     }
@@ -116,11 +114,11 @@ int server_process_connect(server_t *server) {
 
     if (rv == 0) {
         /* Non-blocking socket immediately connected? */
-        perror("server_new: connect");
+        perror("server_process_connect: connect");
         close(sockfd); /* TODO handle connection error (retry later?) */
         return MYSW_ERR;
     } else if (rv < 0 && errno != EINPROGRESS) {
-        perror("server_new: connect");
+        perror("server_process_connect: connect");
         close(sockfd); /* TODO handle connection error (retry later?) */
         return MYSW_ERR;
     } else if (rv < 0 && errno == EINPROGRESS) {
@@ -277,6 +275,7 @@ int server_process_send_handshake_res(server_t *server) {
         return MYSW_ERR;
     }
 
+    pool_server_move_to_free(server->pool, server);
     return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event);
 }
 
@@ -288,7 +287,7 @@ int server_process_wait_client(server_t *server) {
     fdh_reset_rw_state(&server->fdh_socket_out);
     out = &server->fdh_socket_out.buf;
     buf_clear(out);
-    buf_copy_from(out, server->target_client->cmd.payload);
+    buf_copy_from(out, server->target_client->cmd.payload); /* TODO adjust sequence id? */
 
     return server_set_state(server, SERVER_STATE_RECV_CMD, &server->fdh_socket_out);
 }
@@ -299,9 +298,16 @@ int server_process_recv_cmd(server_t *server) {
     fdh_socket = &server->fdh_socket_out;
 
     if (fdh_is_write_finished(fdh_socket)) {
-        /* Finished writing handshake packet. Transition state. */
-        fdh_reset_rw_state(&server->fdh_socket_in);
-        return server_set_state(server, SERVER_STATE_SEND_CMD_RES, &server->fdh_socket_in);
+        /* Finished writing cmd. Transition state. */
+        if (!cmd_expects_response(&server->target_client->cmd)) {
+            /* No response is coming from server, immediately wakeup client */
+            client_wakeup(&server->target_client);
+            return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event);
+        } else {
+            /* Wait for response from server */
+            fdh_reset_rw_state(&server->fdh_socket_in);
+            return server_set_state(server, SERVER_STATE_SEND_CMD_RES, &server->fdh_socket_in);
+        }
     }
 
     return MYSW_OK;
@@ -309,6 +315,14 @@ int server_process_recv_cmd(server_t *server) {
 
 int server_process_send_cmd_res(server_t *server) {
     buf_t *in;
+    size_t pos;
+    int is_ok_eof;
+    uint8_t response_byte, sequence_id;
+    uint16_t warnings, status_flags;
+    uint32_t packet_len;
+    uint64_t affected_rows, last_insert_id;
+    client_t *client;
+    int len;
 
     in = &server->fdh_socket_in.buf;
 
@@ -316,11 +330,75 @@ int server_process_send_cmd_res(server_t *server) {
         return MYSW_OK;
     }
 
-    /* TODO check status flags for in_txn, in_prep_stmt */
+    client = server->target_client;
 
-    buf_copy_from(&server->target_client->cmd_result, in);
-    client_wakeup(server->target_client);
+    /* Read status_flags from OK or EOF packet */
+    is_ok_eof = 0;
+    status_flags = 0;
+    pos = 0;
+    packet_len = buf_get_u24(in, pos);                              pos += 3;
+    sequence_id = buf_get_u8(in, pos);                              pos += 1;
+    response_byte = buf_get_u8(in, pos);                            pos += 1;
+    if (response_byte == MYSQLD_OK && packet_len > 7) {
+        if (client->cmd.cmd_byte == MYSQLD_COM_STMT_PREPARE) {
+            /* COM_STMT_PREPARE_OK? */
+        } else {
+            /* OK packet */
+            is_ok_eof = 1;
+            affected_rows = buf_get_int_lenenc(in, pos, &len);      pos += len;
+            last_insert_id = buf_get_int_lenenc(in, pos, &len);     pos += len;
+            status_flags = buf_get_u16(in, pos);                    pos += 2;
+        }
+    } else if (response_byte == MYSQLD_EOF && packet_len < 9) {
+        /* EOF packet */
+        is_ok_eof = 1;
+        warnings = buf_get_u16(in, pos);                            pos += 2;
+        status_flags = buf_get_u16(in, pos);                        pos += 2;
+    }
 
+    /* Set state based on status_flags from OK or EOF packet */
+    if (is_ok_eof) {
+        if ((status_flags & MYSQLD_SERVER_STATUS_IN_TRANS) || (status_flags & MYSQLD_SERVER_STATUS_IN_TRANS_READONLY)) {
+            server->in_txn = 1;
+        } else {
+            server->in_txn = 0;
+        }
+        if (status_flags & MYSQLD_SERVER_MORE_RESULTS_EXISTS) {
+            server->has_more_results = 1;
+        } else {
+            server->has_more_results = 0;
+        }
+        if ((status_flags & MYSQLD_SERVER_STATUS_CURSOR_EXISTS) || (status_flags & MYSQLD_SERVER_STATUS_LAST_ROW_SENT)) {
+            server->has_prep_stmt = 1;
+        } else {
+            server->has_prep_stmt = 0;
+        }
+    }
+
+    /* Increment response */
+    if (is_ok_eof || response_byte == MYSQLD_ERR) {
+        server->ok_eof_err_count += 1;
+    }
+
+
+    /* Free up server if nothing fancy is going on */
+    if (server->ok_eof_err_count > 0
+        && !server->in_txn
+        && !server->has_prep_stmt
+        && client->prep_stmt_count == 0
+    ) {
+        pool_server_move_to_free(server->pool, server);
+        /* The client should be waiting for `client_wakeup` below, so it should
+         * be safe to mutate `client->target_server` without a lock. */
+        client->target_server = NULL;
+        server->target_client = NULL;
+    }
+
+    /* Copy result to client */
+    buf_copy_from(&client->cmd_result, in);
+    client_wakeup(client);
+
+    /* Clear buffer */
     fdh_reset_rw_state(&server->fdh_socket_in);
 
     return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event);

@@ -132,6 +132,16 @@ int fdh_init(fdh_t *r, fdh_t *w, fdpoll_t *fdpoll, void *udata, pthread_spinlock
     return MYSW_OK;
 }
 
+int fdh_deinit(fdh_t *r, fdh_t *w) {
+    buf_free(&r->buf);
+    memset(r, 0, sizeof(fdh_t));
+    if (w) {
+        buf_free(&w->buf);
+        close(w->fd);
+        memset(w, 0, sizeof(fdh_t));
+    }
+}
+
 int fdh_ensure_watched(fdh_t *fdh) {
     switch (fdh->state) {
         case FDH_STATE_WATCHED:   return MYSW_OK;
