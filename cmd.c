@@ -1,7 +1,7 @@
 #include "mysw.h"
 
-static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client);
-static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t end, client_t *client);
+static int cmd_lex_sql(buf_t *in, cmd_t *cmd);
+static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t end);
 static int cmd_lex_sql_end_stmt(cmd_t *cmd, size_t *start, size_t end);
 
 int cmd_init(client_t *client, buf_t *in, cmd_t *cmd) {
@@ -10,12 +10,12 @@ int cmd_init(client_t *client, buf_t *in, cmd_t *cmd) {
     cmd->cmd_byte = buf_get_u8(in, 4);
     cmd->payload = in;
     if (cmd->cmd_byte == MYSQLD_COM_QUERY || cmd->cmd_byte == MYSQLD_COM_STMT_PREPARE) {
-        cmd_lex_sql(in, cmd, client);
+        cmd_lex_sql(in, cmd);
     }
     return MYSW_OK;
 }
 
-static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client) {
+static int cmd_lex_sql(buf_t *in, cmd_t *cmd) {
     size_t i;
     char b, c, d;
     int in_slash_comment, in_dash_comment, in_hash_comment;
@@ -41,18 +41,18 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client) {
         d = (i < cmd->sql_len - 1) ? cmd->sql[i + 1] : '\0';
         if (in_slash_comment) {
             if (c == '*' && d == '/') {
-                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_COMMENT, &ts, i + 1, client);
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_COMMENT, &ts, i + 1);
                 in_slash_comment = 0;
                 ++i;
             }
         } else if (in_dash_comment) {
             if (c == '\n') {
-                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_COMMENT, &ts, i, client);
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_COMMENT, &ts, i);
                 in_dash_comment = 0;
             }
         } else if (in_hash_comment) {
             if (c == '\n') {
-                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_COMMENT, &ts, i, client);
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_COMMENT, &ts, i);
                 in_hash_comment = 0;
             }
         } else if ((in_double_quote || in_single_quote) && c == '\\') {
@@ -63,17 +63,17 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client) {
             ++i;
         } else if (in_double_quote) {
             if (c == '"') {
-                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_STRING, &ts, i - 1, client);
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_STRING, &ts, i - 1);
                 in_double_quote = 0;
             }
         } else if (in_single_quote) {
             if (c == '\'') {
-                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_STRING, &ts, i - 1, client);
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_STRING, &ts, i - 1);
                 in_single_quote = 0;
             }
         } else if (in_backtick) {
             if (c == '`') {
-                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_BACKTICK, &ts, i - 1, client);
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_BACKTICK, &ts, i - 1);
                 in_backtick = 0;
             }
         } else {
@@ -87,7 +87,7 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client) {
                  *
                  * https://dev.mysql.com/doc/refman/8.0/en/identifiers.html */
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$')) {
-                    cmd_lex_sql_emit_token(cmd, STMT_TOKEN_WORD, &ts, i, client);
+                    cmd_lex_sql_emit_token(cmd, STMT_TOKEN_WORD, &ts, i);
                     in_word = 0;
                 }
             }
@@ -104,10 +104,10 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client) {
             } else if (c == '"') {
                 in_double_quote = 1;
                 ts = i + 1;
-            } else if ((b == '\n' || b == '\0') && c == '#') {
+            } else if ((b == '\0' || isspace(b)) && c == '#') {
                 in_hash_comment = 1;
                 ts = i;
-            } else if ((b == '\n' || b == '\0') && c == '-' && d == '-') {
+            } else if ((b == '\0' || isspace(b)) && c == '-' && d == '-') {
                 in_dash_comment = 1;
                 ts = i;
                 ++i;
@@ -123,14 +123,14 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd, client_t *client) {
         b = c;
     }
 
-    cmd_lex_sql_emit_token(cmd, STMT_TOKEN_WORD, &ts, i, client);
+    cmd_lex_sql_emit_token(cmd, (in_dash_comment || in_hash_comment ? STMT_TOKEN_COMMENT : STMT_TOKEN_WORD), &ts, i);
     cmd_lex_sql_end_stmt(cmd, &ss, i);
     cmd->stmt_cur = cmd->stmt_list;
 
     return MYSW_ERR;
 }
 
-static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t end, client_t *client) {
+static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t end) {
     stmt_t *stmt;
 
     stmt = cmd->stmt_parsing;
@@ -143,16 +143,19 @@ static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t en
 
     if (end > *start) {
         if (type == STMT_TOKEN_COMMENT) {
+            /* Set hint to first comment we see */
             if (stmt->hint == NULL && stmt->first == NULL) {
                 stmt->hint = cmd->sql + *start;
                 stmt->hint_len = end - *start;
-                client_set_hint(client, cmd->sql + *start, end - *start);
+                client_set_hint(cmd->client, cmd->sql + *start, end - *start);
             }
         } else if (stmt->first == NULL) {
+            /* Set to first to first non-comment we see */
             stmt->first = cmd->sql + *start;
             stmt->first_len = end - *start;
         } else if (cmd_stmt_is_use(stmt)) {
-            client_set_db_name(client, cmd->sql + *start, end - *start);
+            /* If we get a 2nd non-comment token and this is a USE stmt, set db name */
+            client_set_db_name(cmd->client, cmd->sql + *start, end - *start);
         }
     }
 

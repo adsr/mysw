@@ -140,6 +140,7 @@ int fdh_deinit(fdh_t *r, fdh_t *w) {
         close(w->fd);
         memset(w, 0, sizeof(fdh_t));
     }
+    return MYSW_OK;
 }
 
 int fdh_ensure_watched(fdh_t *fdh) {

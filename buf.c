@@ -43,7 +43,6 @@ int buf_clear(buf_t *buf) {
 }
 
 int buf_ensure_cap(buf_t *buf, size_t cap) {
-    size_t min_alloc;
     if (buf->cap < cap) {
         if (buf->cap < 16)  buf->cap = 16;
         buf->cap *= 2;

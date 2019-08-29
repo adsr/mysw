@@ -7,7 +7,7 @@ int opt_num_threads = 2; /* TODO saner default */
 int opt_epoll_max_events = 256;
 int opt_epoll_timeout_ms = 1000;
 int opt_read_size = 256;
-char *opt_targeter_socket_path = "/tmp/mysw.sock";
+char *opt_targeter_socket_path = "./mysw.sock";
 server_t *server_a = NULL;
 server_t *server_b = NULL;
 

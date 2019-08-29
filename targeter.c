@@ -40,10 +40,13 @@ int targeter_process(fdh_t *fdh) {
         return MYSW_OK;
     }
 
-    switch (targeter->state) {
-        case TARGETER_STATE_CONNECTING: rv = targeter_process_connecting(targeter); break;
-        case TARGETER_STATE_READ:       rv = targeter_process_read(targeter); break;
-        default: fprintf(stderr, "targeter_process: Invalid targeter state %d\n", targeter->state); rv = MYSW_ERR; break;
+    if (targeter->state == TARGETER_STATE_CONNECTING && fdh == &targeter->fdh_socket_out) {
+        rv = targeter_process_connecting(targeter);
+    } else if (targeter->state == TARGETER_STATE_READ && fdh == &targeter->fdh_socket_in) {
+        rv = targeter_process_read(targeter);
+    } else {
+        fprintf(stderr, "targeter_process: Invalid targeter state %d\n", targeter->state);
+        rv = MYSW_ERR;
     }
 
     return rv;
@@ -67,8 +70,8 @@ int targeter_process_read(targeter_t *targeter) {
     if (len - 4 < response_len) return MYSW_OK;
     request_id = buf_get_u64(buf, pos);     pos += 8;
     client_id = buf_get_u64(buf, pos);      pos += 8;
-    poolname_len = buf_get_u16(buf, pos);   pos += 16;
-    poolname = buf_get(buf, pos);           pos += poolname_len;
+    poolname_len = buf_get_u16(buf, pos);   pos += 2;
+    poolname = (char*)buf_get(buf, pos);           pos += poolname_len;
     /* END parse response */
 
     /* Look up client */
@@ -140,6 +143,7 @@ int targeter_connect(targeter_t *targeter) {
 
     /* Init socket event handle (network io) */
     fdh_init(&targeter->fdh_socket_in, &targeter->fdh_socket_out, targeter->proxy->fdpoll, targeter, &targeter->spinlock, FDH_TYPE_SOCKET, sockfd, targeter_process);
+    targeter->fdh_socket_out.fn_process = NULL;
 
     /* Set non-blocking mode */
     if ((sock_flags = fcntl(sockfd, F_GETFL, 0)) < 0 || fcntl(sockfd, F_SETFL, sock_flags | O_NONBLOCK) < 0) {
@@ -154,15 +158,15 @@ int targeter_connect(targeter_t *targeter) {
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", opt_targeter_socket_path);
     rv = connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
 
-    if (rv == 0) {
-        /* Non-blocking socket immediately connected? */
+    if (rv < 0 && errno != EINPROGRESS) {
         perror("targeter_connect: connect");
         close(sockfd); /* TODO handle connection error (retry later?) */
         return MYSW_ERR;
-    } else if (rv < 0 && errno != EINPROGRESS) {
-        perror("targeter_connect: connect");
-        close(sockfd); /* TODO handle connection error (retry later?) */
-        return MYSW_ERR;
+    } else if (rv == 0) {
+        targeter->state = TARGETER_STATE_READ;
+        try(rv, fdh_ensure_watched(&targeter->fdh_socket_in));
+        try(rv, fdh_ensure_unwatched(&targeter->fdh_socket_out));
+        return MYSW_OK;
     } else if (rv < 0 && errno == EINPROGRESS) {
         /* Socket now connecting */
         /* From connect(2) EINPROGRESS. (It is possible to select(2) or poll(2)

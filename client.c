@@ -9,7 +9,6 @@ static int client_process_wait_cmd_res(client_t *client);
 static int client_process_recv_cmd_res(client_t *client);
 static int client_set_state(client_t *client, int state, fdh_t *fdh);
 
-
 int client_new(proxy_t *proxy, int connfd, client_t **out_client) {
     client_t *client;
     int efd;
@@ -237,7 +236,7 @@ static int client_process_send_cmd(client_t *client) {
             client->prep_stmt_count -= 1;
             break;
         case MYSQLD_COM_INIT_DB:
-            client_set_db_name(client, in->data + 5, in->len - 5);
+            client_set_db_name(client, (char*)in->data + 5, in->len - 5);
             client_write_ok_packet(client);
             return client_set_state(client, CLIENT_STATE_RECV_CMD_RES, &client->fdh_socket_out);
     }
@@ -344,14 +343,13 @@ static int client_process_recv_cmd_res(client_t *client) {
 }
 
 int client_destroy(client_t *client) {
+    close(client->fdh_socket_in.fd);
+    close(client->fdh_event.fd);
     fdh_ensure_unwatched(&client->fdh_socket_in);
     fdh_ensure_unwatched(&client->fdh_socket_out);
     fdh_ensure_unwatched(&client->fdh_event);
-    close(client->fdh_socket_in.fd);
-    close(client->fdh_socket_out.fd);
-    close(client->fdh_event.fd);
-    buf_free(&client->fdh_socket_in.buf);
-    buf_free(&client->fdh_socket_out.buf);
+    fdh_deinit(&client->fdh_socket_in, &client->fdh_socket_out);
+    fdh_deinit(&client->fdh_event, NULL);
     /* TODO avoid use after free, e.g., other objects may have client pointer */
     free(client);
     return MYSW_OK;

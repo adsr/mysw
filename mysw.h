@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
@@ -332,7 +333,6 @@ int server_process_send_handshake_res(server_t *server);
 int server_process_wait_client(server_t *server);
 int server_process_recv_cmd(server_t *server);
 int server_process_send_cmd_res(server_t *server);
-int server_set_client(server_t *server, client_t *client);
 int server_wakeup(server_t *server);
 int server_destroy(fdh_t *fdh);
 int targeter_new(proxy_t *proxy, targeter_t **out_targeter);
@@ -357,6 +357,9 @@ extern server_t *server_b;
 /* https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html */
 
 /*
+
+TODO preallocate
+TODO targlets
 
 CLIENT
                     CLIENT_UNKNOWN

@@ -301,7 +301,7 @@ int server_process_recv_cmd(server_t *server) {
         /* Finished writing cmd. Transition state. */
         if (!cmd_expects_response(&server->target_client->cmd)) {
             /* No response is coming from server, immediately wakeup client */
-            client_wakeup(&server->target_client);
+            client_wakeup(server->target_client);
             return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event);
         } else {
             /* Wait for response from server */
@@ -356,6 +356,11 @@ int server_process_send_cmd_res(server_t *server) {
         status_flags = buf_get_u16(in, pos);                        pos += 2;
     }
 
+    (void)last_insert_id;
+    (void)affected_rows;
+    (void)warnings;
+    (void)sequence_id;
+
     /* Set state based on status_flags from OK or EOF packet */
     if (is_ok_eof) {
         if ((status_flags & MYSQLD_SERVER_STATUS_IN_TRANS) || (status_flags & MYSQLD_SERVER_STATUS_IN_TRANS_READONLY)) {
@@ -402,10 +407,6 @@ int server_process_send_cmd_res(server_t *server) {
     fdh_reset_rw_state(&server->fdh_socket_in);
 
     return server_set_state(server, SERVER_STATE_WAIT_CLIENT, &server->fdh_event);
-}
-
-int server_set_client(server_t *server, client_t *client) {
-    return MYSW_ERR;
 }
 
 int server_wakeup(server_t *server) {

@@ -124,9 +124,9 @@ int pool_server_move_to_reserved(pool_t *pool, server_t *server) {
 }
  
 static int pool_server_remove_from_list(pool_t *pool, server_t *server) {
-    if (server->in_dead)     LL_DELETE2(server->pool->servers_dead,     server, next_in_dead);
-    if (server->in_free)     LL_DELETE2(server->pool->servers_free,     server, next_in_free);
-    if (server->in_reserved) LL_DELETE2(server->pool->servers_reserved, server, next_in_reserved);
+    if (server->in_dead)     LL_DELETE2(pool->servers_dead,     server, next_in_dead);
+    if (server->in_free)     LL_DELETE2(pool->servers_free,     server, next_in_free);
+    if (server->in_reserved) LL_DELETE2(pool->servers_reserved, server, next_in_reserved);
     server->in_dead = 0;
     server->in_free = 0;
     server->in_reserved = 0;
@@ -184,5 +184,6 @@ int pool_queue_client(pool_t *pool, client_t *client) {
 }
 
 int pool_wakeup(pool_t *pool) {
+    (void)pool;
     return MYSW_ERR;
 }
