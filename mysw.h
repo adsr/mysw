@@ -34,13 +34,13 @@
 #define MYSQLD_CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA 0x00200000
 #define MYSQLD_CLIENT_PROTOCOL_41                    0x00000200
 #define MYSQLD_CLIENT_SECURE_CONNECTION              0x00008000
-#define MYSQLD_SERVER_STATUS_AUTOCOMMIT              0x00000002
 
-#define MYSQLD_SERVER_STATUS_IN_TRANS          0x0001
-#define MYSQLD_SERVER_STATUS_IN_TRANS_READONLY 0x2000
-#define MYSQLD_SERVER_MORE_RESULTS_EXISTS      0x0008
-#define MYSQLD_SERVER_STATUS_CURSOR_EXISTS     0x0040
-#define MYSQLD_SERVER_STATUS_LAST_ROW_SENT     0x0080
+#define MYSQLD_SERVER_STATUS_AUTOCOMMIT              0x0002
+#define MYSQLD_SERVER_STATUS_IN_TRANS                0x0001
+#define MYSQLD_SERVER_STATUS_IN_TRANS_READONLY       0x2000
+#define MYSQLD_SERVER_MORE_RESULTS_EXISTS            0x0008
+#define MYSQLD_SERVER_STATUS_CURSOR_EXISTS           0x0040
+#define MYSQLD_SERVER_STATUS_LAST_ROW_SENT           0x0080
 
 #define MYSQLD_COM_QUERY                             0x03
 #define MYSQLD_COM_STMT_PREPARE                      0x16
@@ -53,12 +53,13 @@
 #define MYSQLD_EOF                                   0xfe
 #define MYSQLD_ERR                                   0xff
 
-#define try(__rv, __call) do { if (((__rv) = (__call)) != MYSW_OK) return (__rv); } while(0)
+#define try(__rv, __call)       do { if (((__rv) = (__call)) != MYSW_OK) return (__rv); } while(0)
+#define try_break(__rv, __call) do { if (((__rv) = (__call)) != MYSW_OK) break; } while(0)
 
 extern char *opt_addr;
 extern int opt_port;
 extern int opt_backlog;
-extern int opt_num_threads;
+extern int opt_num_worker_threads;
 extern int opt_epoll_max_events;
 extern int opt_epoll_timeout_ms;
 extern int opt_read_size;
@@ -117,8 +118,10 @@ struct _proxy_t {
     worker_t *workers;
     targeter_t *targeter;
     pool_t *pool_map;
-    pthread_spinlock_t spinlock_pool_map;
-    pthread_t signal_thread;
+    pthread_spinlock_t *spinlock_pool_map;
+    pthread_spinlock_t spinlock_pool_map_val;
+    pthread_t *signal_thread;
+    pthread_t signal_thread_val;
     int done;
     fdh_t fdh_listen;
 };
@@ -142,10 +145,11 @@ struct _cmd_t {
 };
 
 struct _stmt_t {
-    #define STMT_TOKEN_COMMENT  0
-    #define STMT_TOKEN_STRING   1
-    #define STMT_TOKEN_BACKTICK 2
-    #define STMT_TOKEN_WORD     3
+    #define STMT_TOKEN_COMMENT   0
+    #define STMT_TOKEN_STRING    1
+    #define STMT_TOKEN_BACKTICK  2
+    #define STMT_TOKEN_IDENT     3
+    #define STMT_TOKEN_NON_IDENT 4
     char *sql;
     size_t sql_len;
     char *hint;
@@ -334,7 +338,7 @@ int server_process_wait_client(server_t *server);
 int server_process_recv_cmd(server_t *server);
 int server_process_send_cmd_res(server_t *server);
 int server_wakeup(server_t *server);
-int server_destroy(fdh_t *fdh);
+int server_destroy(server_t *server);
 int targeter_new(proxy_t *proxy, targeter_t **out_targeter);
 int targeter_process(fdh_t *fdh);
 int targeter_process_read(targeter_t *targeter);
@@ -354,62 +358,21 @@ int worker_accept_conn(fdh_t *fdh);
 extern server_t *server_a;
 extern server_t *server_b;
 
-/* https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html */
+/* 
 
-/*
+https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html
 
-TODO preallocate
-TODO targlets
+TODO list
+- write targlets
+- preallocate clients, targlets in addition to servers
+- make dns lookup async
+- use getopt
+- max out wait_timeout on server connect (new states)
+- audit error checking everywhere
+- write unit tests for sql parsing
+- write integration tests
+- test client/server init/deinit disconnect/reconnect/failure modes
 
-CLIENT
-                    CLIENT_UNKNOWN
-(1) <- hello        CLIENT_RECV_HANDSHAKE_INIT          on sockfd writeable
-(2) hello_res ->    CLIENT_SEND_HANDSHAKE_INIT_RES      on sockfd readable
-(3) <- ok_err       CLIENT_RECV_HANDSHAKE_INIT_OK       on sockfd writeable
-(4) cmd ->          CLIENT_SEND_CMD                     on sockfd readable
-                    if need specific mysqld (txn, prepared stmt, etc):
-                      (set server.cmd + write eventfd)
-                    elif has pool:
-                      (add to pool.queue + write eventfd)
-                    else need targeting:
-                      (add to targeter.queue + write eventfd)
-(5) <- cmd_res      CLIENT_WAIT_CMD_RES                 on client.eventfd readable (triggered by SERVER_SEND_CMD_RES)
-                    (client.stmt = client.stmt->next, goto CLIENT_SEND_CMD, else CLIENT_RECV_CMD_RES)
-                    CLIENT_RECV_CMD_RES                 on sockfd writeable
-                    CLIENT_DISCONNECTED
-
-
-TARGETER
-                    TARGETER_UNKNOWN
-                    TARGETER_WAIT_TARGET_REQ             on eventfd readable (triggered by CLIENT_SEND_CMD)
-                    TARGETER_SEND_TARGET_REQ             on targetfd writeable
-                    TARGETER_RECV_TARGET_RES             on targetfd readable
-                    (add cmd to pool.queue + write eventfd)
-                    (always wait on eventfd, wait on targetfd writeable if queue>0, wait on targetfd readable if waiting>0)
-
-SERVER
-                    SERVER_UNKNOWN
-                    SERVER_WAIT_CONNECT         on server.timerfd readable (triggered by SERVER_DISCONNECTED)
-(0)                 SERVER_CONNECTING           on sockfd readable
-(1) <- hello        SERVER_SEND_HELLO           on sockfd readable
-(2) hello_res ->    SERVER_RECV_HELLO_RES       on sockfd writeable
-(3) <- ok_err       SERVER_SEND_HELLO_OK        on sockfd readable
-                    (move to pool.free + write pool.eventfd)
-(4) cmd ->          SERVER_WAIT_CMD             on server.eventfd readable (triggered by POOL_WAIT_DEQUEUE or CLIENT_SEND_CMD)
-                    SERVER_RECV_CMD             on sockfd writeable
-(5) <- cmd_res      SERVER_SEND_CMD_RES         on sockfd readable
-                    (mark server.cmd.processed)
-                    (write client.eventfd)
-                    (move to pool.free + write pool.eventfd unless in_txn or prepared stmt)
-                    SERVER_DISCONNECTED
-                    (requeue server.cmd if not .processed)
-
-POOL
-                    POOL_UNKNOWN
-                    POOL_WAIT_DEQUEUE           pool.eventfd readable (triggered by SERVER_SEND_HELLO_OK, SERVER_SEND_CMD_RES, CLIENT_SEND_CMD)
-                    (dequeue from pool.queue)
-                    (find server in pool.free, move to pool.reserved, set server.cmd, write server.eventfd)
-                    
 */
 
 #endif

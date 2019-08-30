@@ -10,10 +10,12 @@ int worker_init(worker_t *worker, proxy_t *proxy) {
 
 int worker_spawn(worker_t *worker) {
     int rv;
-    if ((rv = pthread_create(&worker->thread, NULL, worker_main, worker)) == 0) {
-        worker->spawned = 1;
+    if ((rv = pthread_create(&worker->thread, NULL, worker_main, worker)) != 0) {
+        fprintf(stderr, "worker_spawn: pthread_create: %s\n", strerror(rv));
+        return MYSW_ERR;
     }
-    return rv;
+    worker->spawned = 1;
+    return MYSW_OK;
 }
 
 int worker_join(worker_t *worker) {

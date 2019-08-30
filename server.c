@@ -415,9 +415,10 @@ int server_wakeup(server_t *server) {
     return (write(server->fdh_event.fd, &i, sizeof(i)) == sizeof(i)) ? MYSW_OK : MYSW_ERR;
 }
 
-int server_destroy(fdh_t *fdh) {
-    server_t *server;
-    server = fdh->udata;
+int server_destroy(server_t *server) {
+    fdh_deinit(&server->fdh_event, NULL);
+    fdh_deinit(&server->fdh_timer, NULL);
+    fdh_deinit(&server->fdh_socket_in, &server->fdh_socket_out);
     free(server->host);
     free(server);
     return MYSW_OK;

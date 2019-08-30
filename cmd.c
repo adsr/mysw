@@ -1,5 +1,6 @@
 #include "mysw.h"
 
+static int cmd_lex_sql_is_ident_char(char c);
 static int cmd_lex_sql(buf_t *in, cmd_t *cmd);
 static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t end);
 static int cmd_lex_sql_end_stmt(cmd_t *cmd, size_t *start, size_t end);
@@ -20,8 +21,9 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd) {
     char b, c, d;
     int in_slash_comment, in_dash_comment, in_hash_comment;
     int in_double_quote, in_single_quote, in_backtick;
-    int in_word;
+    int in_ident, in_non_ident;
     size_t ss, ts;
+    int final_type;
 
     cmd->sql = buf_get_streof(in, 5, &cmd->sql_len);
 
@@ -31,7 +33,8 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd) {
     in_double_quote = 0;
     in_single_quote = 0;
     in_backtick = 0;
-    in_word = 0;
+    in_ident = 0;
+    in_non_ident = 0;
 
     ss = 0;
     ts = 0;
@@ -77,19 +80,21 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd) {
                 in_backtick = 0;
             }
         } else {
-            if (in_word) {
-                /* Permitted characters in unquoted identifiers:
-                 *
-                 *   ASCII: [0-9,a-z,A-Z$_] (basic Latin letters, digits 0-9, dollar, underscore)
-                 *   Extended: U+0080 .. U+FFFF
-                 *
-                 * TODO not handling wide chars for now
-                 *
-                 * https://dev.mysql.com/doc/refman/8.0/en/identifiers.html */
-                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$')) {
-                    cmd_lex_sql_emit_token(cmd, STMT_TOKEN_WORD, &ts, i);
-                    in_word = 0;
-                }
+            /* Permitted characters in unquoted identifiers:
+             *
+             *   ASCII: [0-9,a-z,A-Z$_] (basic Latin letters, digits 0-9, dollar, underscore)
+             *   Extended: U+0080 .. U+FFFF
+             *
+             * TODO not handling wide chars for now
+             *
+             * https://dev.mysql.com/doc/refman/8.0/en/identifiers.html */
+            if (in_ident && !cmd_lex_sql_is_ident_char(c)) {
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_IDENT, &ts, i);
+                in_ident = 0;
+            }
+            if (in_non_ident && (cmd_lex_sql_is_ident_char(c) || isspace(c) || c == ';')) {
+                cmd_lex_sql_emit_token(cmd, STMT_TOKEN_NON_IDENT, &ts, i);
+                in_non_ident = 0;
             }
             if (c == ';') {
                 /* If cmd->cmd_byte is MYSQLD_COM_STMT_PREPARE, this is going
@@ -115,15 +120,30 @@ static int cmd_lex_sql(buf_t *in, cmd_t *cmd) {
                 in_slash_comment = 1;
                 ts = i;
                 ++i;
-            } else if (!in_word && !isspace(c)) {
-                in_word = 1;
-                ts = i;
+            } else if (!in_ident && !in_non_ident) {
+                if (cmd_lex_sql_is_ident_char(c)) {
+                    in_ident = 1;
+                    ts = i;
+                } else if (c != ';' && !isspace(c)) {
+                    in_non_ident = 1;
+                    ts = i;
+                }
             }
         }
         b = c;
     }
 
-    cmd_lex_sql_emit_token(cmd, (in_dash_comment || in_hash_comment ? STMT_TOKEN_COMMENT : STMT_TOKEN_WORD), &ts, i);
+    final_type = -1;
+    if (in_dash_comment || in_hash_comment) {
+        final_type = STMT_TOKEN_COMMENT;
+    } else if (in_ident) {
+        final_type = STMT_TOKEN_IDENT;
+    } else if (in_non_ident) {
+        final_type = STMT_TOKEN_NON_IDENT;
+    }
+    if (final_type != -1) {
+        cmd_lex_sql_emit_token(cmd, final_type, &ts, i);
+    }
     cmd_lex_sql_end_stmt(cmd, &ss, i);
     cmd->stmt_cur = cmd->stmt_list;
 
@@ -142,25 +162,33 @@ static int cmd_lex_sql_emit_token(cmd_t *cmd, int type, size_t *start, size_t en
     }
 
     if (end > *start) {
-        if (type == STMT_TOKEN_COMMENT) {
+        if (type == STMT_TOKEN_COMMENT && stmt->hint == NULL && stmt->first == NULL) {
             /* Set hint to first comment we see */
-            if (stmt->hint == NULL && stmt->first == NULL) {
-                stmt->hint = cmd->sql + *start;
-                stmt->hint_len = end - *start;
-                client_set_hint(cmd->client, cmd->sql + *start, end - *start);
-            }
-        } else if (stmt->first == NULL) {
-            /* Set to first to first non-comment we see */
+            stmt->hint = cmd->sql + *start;
+            stmt->hint_len = end - *start;
+            client_set_hint(cmd->client, cmd->sql + *start, end - *start);
+        }
+        if (type == STMT_TOKEN_IDENT && stmt->first == NULL) {
+            /* Set to first to first ident we see */
             stmt->first = cmd->sql + *start;
             stmt->first_len = end - *start;
-        } else if (cmd_stmt_is_use(stmt)) {
-            /* If we get a 2nd non-comment token and this is a USE stmt, set db name */
+        }
+        if ((type == STMT_TOKEN_IDENT || type == STMT_TOKEN_BACKTICK) && stmt->first != NULL && cmd_stmt_is_use(stmt)) {
+            /* If we get a 2nd ident token and this is a USE stmt, set db name */
             client_set_db_name(cmd->client, cmd->sql + *start, end - *start);
         }
     }
 
     *start = end;
     return MYSW_OK;
+}
+
+static int cmd_lex_sql_is_ident_char(char c) {
+    return (c >= 'A' && c <= 'Z')
+        || (c >= 'a' && c <= 'z')
+        || (c >= '0' && c <= '9')
+        || c == '_'
+        || c == '$';
 }
 
 static int cmd_lex_sql_end_stmt(cmd_t *cmd, size_t *start, size_t end) {

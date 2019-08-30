@@ -155,7 +155,7 @@ int targeter_connect(targeter_t *targeter) {
     /* Connect */
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", opt_targeter_socket_path);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", "TODO not this anymore");
     rv = connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
 
     if (rv < 0 && errno != EINPROGRESS) {

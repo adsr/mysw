@@ -19,9 +19,9 @@ int pool_new(proxy_t *proxy, char *name, pool_t **out_pool) {
     fdh_init(&pool->fdh_event, NULL, proxy->fdpoll, pool, NULL, FDH_TYPE_EVENT, efd, pool_process);
 
     /* Add to pool_map */
-    pthread_spin_lock(&proxy->spinlock_pool_map);
+    pthread_spin_lock(proxy->spinlock_pool_map);
     HASH_ADD_KEYPTR(hh, proxy->pool_map, pool->name, strlen(pool->name), pool);
-    pthread_spin_unlock(&proxy->spinlock_pool_map);
+    pthread_spin_unlock(proxy->spinlock_pool_map);
 
     *out_pool = pool;
     return MYSW_OK;
@@ -62,9 +62,9 @@ int pool_find(proxy_t *proxy, char *name, size_t name_len, pool_t **out_pool) {
     pool = NULL;
 
     /* Find in pool_map */
-    pthread_spin_lock(&proxy->spinlock_pool_map);
+    pthread_spin_lock(proxy->spinlock_pool_map);
     HASH_FIND(hh, proxy->pool_map, name, name_len, pool);
-    pthread_spin_unlock(&proxy->spinlock_pool_map);
+    pthread_spin_unlock(proxy->spinlock_pool_map);
 
     *out_pool = pool;
     return MYSW_OK;
@@ -161,9 +161,9 @@ int pool_destroy(pool_t *pool) {
     pthread_spin_unlock(&pool->spinlock_client_queue);
 
     /* Delete self from pool_map */
-    pthread_spin_lock(&pool->proxy->spinlock_pool_map);
+    pthread_spin_lock(pool->proxy->spinlock_pool_map);
     HASH_DEL(pool->proxy->pool_map, pool);
-    pthread_spin_unlock(&pool->proxy->spinlock_pool_map);
+    pthread_spin_unlock(pool->proxy->spinlock_pool_map);
 
     pthread_spin_destroy(&pool->spinlock_server_lists);
     pthread_spin_destroy(&pool->spinlock_client_queue);
