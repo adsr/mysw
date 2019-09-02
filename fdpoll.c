@@ -30,6 +30,7 @@ int fdpoll_event_loop(fdpoll_t *fdpoll) {
     int nfds, i;
     struct epoll_event *events;
     fdh_t *fdh;
+    fdo_t *fdo;
 
     events = calloc(opt_epoll_max_events, sizeof(struct epoll_event));
 
@@ -44,18 +45,18 @@ int fdpoll_event_loop(fdpoll_t *fdpoll) {
         /* Handle events */
         for (i = 0; i < nfds; ++i) {
             fdh = (fdh_t *)events[i].data.ptr;
+            fdo = fdh->fdo;
             fdh->epoll_events = events[i].events;
 
             /* Lock */
-            if (fdh->spinlock) {
-                pthread_spin_lock(fdh->spinlock);
-            }
+            if (fdo->uspinlock) pthread_spin_lock(fdo->uspinlock);
 
-            /* Another thread handled and unwatched us */
+            /* TODO not sure if we need this
+            |* Another thread handled and unwatched us *|
             if (fdh->state == FDH_STATE_UNWATCHED) {
-                pthread_spin_unlock(fdh->spinlock);
+                pthread_spin_unlock(fdo->uspinlock);
                 continue;
-            }
+            } */
 
             /* Re-arm before doing i/o in EPOLLONESHOT */
             /* See https://stackoverflow.com/a/14241095/6048039 */
@@ -86,14 +87,10 @@ int fdpoll_event_loop(fdpoll_t *fdpoll) {
             }
 
             /* Invoke type-specific handler (client_process, server_process, etc) */
-            if (fdh->fn_process) {
-                (fdh->fn_process)(fdh);
-            }
+            (fdo->uprocess)(fdh);
 
             /* Unlock */
-            if (fdh->spinlock) {
-                pthread_spin_unlock(fdh->spinlock);
-            }
+            if (fdo->uspinlock) pthread_spin_unlock(fdo->uspinlock);
         }
     }
 
@@ -101,45 +98,75 @@ int fdpoll_event_loop(fdpoll_t *fdpoll) {
     return MYSW_OK;
 }
 
-int fdh_init(fdh_t *r, fdh_t *w, fdpoll_t *fdpoll, void *udata, pthread_spinlock_t *spinlock, int type, int rfd, int (*fn_process)(fdh_t *)) {
-    int wfd;
+int fdo_init(fdo_t *fdo, fdpoll_t *fdpoll, void *udata, int *ustate, pthread_spinlock_t *uspinlock, int sockfd, int eventfd, int timerfd, int (*uprocess)(fdh_t *)) {
+    memset(fdo, 0, sizeof(fdo_t));
+    fdo->fdpoll = fdpoll;
+    fdo->udata = udata;
+    fdo->ustate = ustate;
+    fdo->uspinlock = uspinlock;
+    fdo->uprocess = uprocess;
 
-    memset(r, 0, sizeof(fdh_t));
-    r->fdpoll = fdpoll;
-    r->udata = udata;
-    r->fn_process = fn_process;
-    r->type = type;
-    r->fd = rfd;
-    r->is_writeable = 0;
-    r->spinlock = spinlock;
+    if (sockfd != -1) {
+        fdo_init_socket(fdo, sockfd);
+    }
 
-    if (w) {
-        wfd = dup(rfd);
-        if (wfd < 0) {
-            perror("fdh_init: dup");
-            return MYSW_ERR;
-        }
-        memset(w, 0, sizeof(fdh_t));
-        w->fdpoll = fdpoll;
-        w->udata = udata;
-        w->fn_process = fn_process;
-        w->type = type;
-        w->fd = wfd;
-        w->is_writeable = 1;
-        w->spinlock = spinlock;
+    if (eventfd != -1) {
+        fdh_init(&fdo->event_in, fdo, FDH_TYPE_EVENT_IN, eventfd);
+    }
+
+    if (timerfd != -1) {
+        fdh_init(&fdo->timer_in, fdo, FDH_TYPE_TIMER_IN, timerfd);
     }
 
     return MYSW_OK;
 }
 
-int fdh_deinit(fdh_t *r, fdh_t *w) {
-    buf_free(&r->buf);
-    memset(r, 0, sizeof(fdh_t));
-    if (w) {
-        buf_free(&w->buf);
-        close(w->fd);
-        memset(w, 0, sizeof(fdh_t));
+int fdo_init_socket(fdo_t *fdo, int sockfd) {
+    int wsockfd;
+    wsockfd = dup(sockfd);
+    if (wsockfd < 0) {
+        perror("fdo_init_socket: dup");
+        return MYSW_ERR;
     }
+    fdh_init(&fdo->socket_in, fdo, FDH_TYPE_SOCKET_IN, sockfd);
+    fdh_init(&fdo->socket_out, fdo, FDH_TYPE_SOCKET_OUT, wsockfd);
+    return MYSW_OK;
+}
+
+int fdo_deinit(fdo_t *fdo) {
+    fdo_set_state(fdo, 0, 0);
+    fdh_deinit(&fdo->socket_in);
+    close(fdo->socket_out.fd);
+    fdh_deinit(&fdo->socket_out);
+    fdh_deinit(&fdo->event_in); /* TODO drain (read until EAGAIN)? */
+    fdh_deinit(&fdo->timer_in); /* TODO timerfd_settime disarm? */
+    return MYSW_OK;
+}
+
+int fdo_set_state(fdo_t *fdo, int state, int watch_types) {
+    int rv;
+    if (!(watch_types & FDH_TYPE_SOCKET_IN))  try(rv, fdh_ensure_unwatched(&fdo->socket_in));
+    if (!(watch_types & FDH_TYPE_SOCKET_OUT)) try(rv, fdh_ensure_unwatched(&fdo->socket_out));
+    if (!(watch_types & FDH_TYPE_EVENT_IN))   try(rv, fdh_ensure_unwatched(&fdo->event_in));
+    if (!(watch_types & FDH_TYPE_TIMER_IN))   try(rv, fdh_ensure_unwatched(&fdo->timer_in));
+    if ( (watch_types & FDH_TYPE_SOCKET_IN))  try(rv, fdh_ensure_watched(&fdo->socket_in));
+    if ( (watch_types & FDH_TYPE_SOCKET_OUT)) try(rv, fdh_ensure_watched(&fdo->socket_out));
+    if ( (watch_types & FDH_TYPE_EVENT_IN))   try(rv, fdh_ensure_watched(&fdo->event_in));
+    if ( (watch_types & FDH_TYPE_TIMER_IN))   try(rv, fdh_ensure_watched(&fdo->timer_in));
+    if (fdo->ustate) *(fdo->ustate) = state;
+    return MYSW_OK;
+}
+
+int fdh_init(fdh_t *fdh, fdo_t *fdo, int type, int fd) {
+    memset(fdh, 0, sizeof(fdh_t));
+    fdh->fdo = fdo;
+    fdh->type = type;
+    fdh->fd = fd;
+    return MYSW_OK;
+}
+
+int fdh_deinit(fdh_t *fdh) {
+    buf_free(&fdh->buf);
     return MYSW_OK;
 }
 
@@ -173,21 +200,21 @@ int fdh_watch(fdh_t *fdh) {
     }
 
     /* Set appropriate flags */
-    epoll_flags = fdh->is_writeable ? EPOLLOUT : EPOLLIN;
+    epoll_flags = fdh_is_writeable(fdh) ? EPOLLOUT : EPOLLIN;
 
     /* Use edge-triggered behavior for socket reads */
-    if (fdh->type == FDH_TYPE_SOCKET && !fdh->is_writeable) {
+    if (fdh->type == FDH_TYPE_SOCKET_IN) {
         epoll_flags |= EPOLLET;
     }
 
     /* Init epoll_event */
     memset(&ev, 0, sizeof(ev));
-    ev.events = fdh->fdpoll->epoll_flags | epoll_flags;
+    ev.events = fdh->fdo->fdpoll->epoll_flags | epoll_flags;
     ev.data.ptr = fdh;
 
     /* Add to epoll */
     epoll_op = (fdh->state == FDH_STATE_ONESHOT) ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-    if ((epoll_ctl(fdh->fdpoll->epoll_fd, epoll_op, fdh->fd, &ev)) < 0) {
+    if ((epoll_ctl(fdh->fdo->fdpoll->epoll_fd, epoll_op, fdh->fd, &ev)) < 0) {
         perror("fdh_watch: epoll_ctl");
         return MYSW_ERR;
     }
@@ -204,7 +231,7 @@ int fdh_unwatch(fdh_t *fdh) {
     }
 
     /* Remove from epoll */
-    if ((epoll_ctl(fdh->fdpoll->epoll_fd, EPOLL_CTL_DEL, fdh->fd, NULL)) < 0) {
+    if ((epoll_ctl(fdh->fdo->fdpoll->epoll_fd, EPOLL_CTL_DEL, fdh->fd, NULL)) < 0) {
         perror("fdh_unwatch: epoll_ctl");
         return MYSW_ERR;
     }
@@ -214,7 +241,7 @@ int fdh_unwatch(fdh_t *fdh) {
 }
 
 int fdh_read(fdh_t *fdh) {
-    if (fdh->type == FDH_TYPE_EVENT) {
+    if (fdh->type == FDH_TYPE_EVENT_IN) {
         return fdh_read_event(fdh);
     }
     return fdh_read_socket(fdh);
@@ -344,13 +371,20 @@ int fdh_is_write_unfinished(fdh_t *fdh) {
 }
 
 int fdh_is_writing(fdh_t *fdh) {
-    if (fdh->is_writeable && fdh->buf.len > 0) {
+    if (fdh_is_writeable(fdh) && fdh->buf.len > 0) {
         return 1;
     }
     return 0;
 }
 
-int fdh_reset_rw_state(fdh_t *fdh) {
+int fdh_is_writeable(fdh_t *fdh) {
+    if (fdh->type == FDH_TYPE_SOCKET_OUT) {
+        return 1;
+    }
+    return 0;
+}
+
+int fdh_clear(fdh_t *fdh) {
     buf_clear(&fdh->buf);
     fdh->epoll_events = 0;
     fdh->buf_cursor = 0;

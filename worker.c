@@ -33,10 +33,10 @@ int worker_accept_conn(fdh_t *fdh) {
     client_t *client;
     int connfd, sock_flags;
 
-    proxy = fdh->udata;
+    proxy = fdh->fdo->udata;
 
     /* Accept client conn */
-    if ((connfd = accept(proxy->fdh_listen.fd, NULL, NULL)) < 0) {
+    if ((connfd = accept(fdh->fd, NULL, NULL)) < 0) {
         perror("worker_accept_conn: accept");
         return MYSW_ERR;
     }

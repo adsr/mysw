@@ -81,12 +81,7 @@ static int main_init_globals(proxy_t **out_proxy) {
     /* Init pools and servers */
     /* TODO user configurable pools */
     pool_new(proxy, "pool_a", &pool_a);
-
-    server_new(proxy, pool_a, "127.0.0.1", 3306, &server_a);
-    server_process_connect(server_a);
-
-    server_new(proxy, pool_a, "127.0.0.1", 3316, &server_b);
-    server_process_connect(server_b);
+    pool_fill(pool_a, "127.0.0.1", 3306, "test", 10);
 
     /* Init targeter and targlets */
     /* TODO user configurable targeters */
@@ -137,15 +132,15 @@ static int main_join_workers(proxy_t *proxy) {
 
 static int main_listen_socket(proxy_t *proxy) {
     struct sockaddr_in addr;
-    int rv, listenfd, optval;
+    int listenfd, optval;
 
     /* Create listener socket */
-    proxy->fdh_listen.fd = -1;
+    proxy->fdo.socket_in.fd = -1;
     if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("main_listen_socket: socket");
         return MYSW_ERR;
     }
-    proxy->fdh_listen.fd = listenfd;
+    proxy->fdo.socket_in.fd = listenfd;
 
     /* Set SO_REUSEPORT */
     optval = 1;
@@ -171,8 +166,9 @@ static int main_listen_socket(proxy_t *proxy) {
     }
 
     /* Add listener socket to event loop */
-    fdh_init(&proxy->fdh_listen, NULL, proxy->fdpoll, proxy, NULL, FDH_TYPE_SOCKET, listenfd, worker_accept_conn);
-    try(rv, fdh_watch(&proxy->fdh_listen));
+    fdo_init(&proxy->fdo, proxy->fdpoll, proxy, NULL, NULL, listenfd, -1, -1, worker_accept_conn);
+    proxy->fdo.socket_in.read_write_skip = 1;
+    fdo_set_state(&proxy->fdo, 0, FDH_TYPE_SOCKET_IN);
 
     return MYSW_OK;
 }
@@ -244,14 +240,14 @@ static int main_deinit(proxy_t *proxy) {
         signal_handle(0);
         pthread_join(*proxy->signal_thread, NULL);
     }
-    if (proxy->fdh_listen.fd != -1) {
-        close(proxy->fdh_listen.fd);
-        fdh_deinit(&proxy->fdh_listen, NULL);
+    if (proxy->fdo.socket_in.fd != -1) {
+        close(proxy->fdo.socket_in.fd);
+        fdo_deinit(&proxy->fdo);
     }
     if (proxy->fdpoll) fdpoll_free(proxy->fdpoll);
     if (proxy->workers) free(proxy->workers);
     /* TODO if (proxy->pool_map) pool_free_all(proxy); */
-    if (proxy->targeter) targeter_free(proxy->targeter);
+    /* if (proxy->targeter) targeter_free(proxy->targeter); */
     if (proxy->spinlock_pool_map) pthread_spin_destroy(proxy->spinlock_pool_map);
     free(proxy);
     return MYSW_OK;

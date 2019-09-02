@@ -1,7 +1,5 @@
 #include "mysw.h"
 
-static int pool_server_remove_from_list(pool_t *pool, server_t *server);
-
 int pool_new(proxy_t *proxy, char *name, pool_t **out_pool) {
     pool_t *pool;
     int efd;
@@ -16,7 +14,7 @@ int pool_new(proxy_t *proxy, char *name, pool_t **out_pool) {
     pthread_spin_init(&pool->spinlock_server_lists, PTHREAD_PROCESS_PRIVATE);
     pthread_spin_init(&pool->spinlock_client_queue, PTHREAD_PROCESS_PRIVATE);
 
-    fdh_init(&pool->fdh_event, NULL, proxy->fdpoll, pool, NULL, FDH_TYPE_EVENT, efd, pool_process);
+    fdo_init(&pool->fdo, proxy->fdpoll, pool, &pool->state, NULL, -1, efd, -1, pool_process);
 
     /* Add to pool_map */
     pthread_spin_lock(proxy->spinlock_pool_map);
@@ -32,7 +30,7 @@ int pool_process(fdh_t *fdh) {
     client_t *client;
     server_t *server;
 
-    pool = fdh->udata;
+    pool = fdh->fdo->udata;
 
     /* Reserve a free server */
     pool_server_reserve(pool, &server);
@@ -70,11 +68,11 @@ int pool_find(proxy_t *proxy, char *name, size_t name_len, pool_t **out_pool) {
     return MYSW_OK;
 }
 
-int pool_fill(pool_t *pool, char *host, int port, int n) {
+int pool_fill(pool_t *pool, char *host, int port, char *dbname, int n) {
     server_t *server;
     int i;
     for (i = 0; i < n; i++) {
-        server_new(pool->proxy, pool, host, port, &server);
+        server_new(pool, host, port, dbname, &server);
         pool_server_move_to_dead(pool, server);
     }
     return MYSW_OK;
@@ -122,8 +120,8 @@ int pool_server_move_to_reserved(pool_t *pool, server_t *server) {
     pthread_spin_unlock(&pool->spinlock_server_lists);
     return MYSW_OK;
 }
- 
-static int pool_server_remove_from_list(pool_t *pool, server_t *server) {
+
+int pool_server_remove_from_list(pool_t *pool, server_t *server) {
     if (server->in_dead)     LL_DELETE2(pool->servers_dead,     server, next_in_dead);
     if (server->in_free)     LL_DELETE2(pool->servers_free,     server, next_in_free);
     if (server->in_reserved) LL_DELETE2(pool->servers_reserved, server, next_in_reserved);
@@ -131,6 +129,19 @@ static int pool_server_remove_from_list(pool_t *pool, server_t *server) {
     server->in_free = 0;
     server->in_reserved = 0;
     return MYSW_OK;
+}
+
+
+int pool_queue_client(pool_t *pool, client_t *client) {
+    pthread_spin_lock(&pool->spinlock_client_queue);
+    LL_APPEND2(pool->client_queue, client, next_in_pool);
+    pthread_spin_unlock(&pool->spinlock_client_queue);
+    return MYSW_ERR;
+}
+
+int pool_wakeup(pool_t *pool) {
+    (void)pool;
+    return MYSW_ERR;
 }
 
 int pool_destroy(pool_t *pool) {
@@ -168,22 +179,10 @@ int pool_destroy(pool_t *pool) {
     pthread_spin_destroy(&pool->spinlock_server_lists);
     pthread_spin_destroy(&pool->spinlock_client_queue);
 
-    close(pool->fdh_event.fd);
-    fdh_deinit(&pool->fdh_event, NULL);
+    close(pool->fdo.event_in.fd);
+    fdo_deinit(&pool->fdo);
 
     free(pool->name);
     free(pool);
     return MYSW_OK;
-}
-
-int pool_queue_client(pool_t *pool, client_t *client) {
-    pthread_spin_lock(&pool->spinlock_client_queue);
-    LL_APPEND2(pool->client_queue, client, next_in_pool);
-    pthread_spin_unlock(&pool->spinlock_client_queue);
-    return MYSW_ERR;
-}
-
-int pool_wakeup(pool_t *pool) {
-    (void)pool;
-    return MYSW_ERR;
 }
