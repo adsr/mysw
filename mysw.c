@@ -1,193 +1,180 @@
-#include "mysw.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include "aco.h"
 
-char *opt_addr = NULL;
-int opt_port = 3307;
-int opt_backlog = 16;
-int opt_num_worker_threads = 2; /* TODO saner defaults */
-int opt_epoll_max_events = 256;
-int opt_epoll_timeout_ms = 1000;
-int opt_read_size = 256;
-pool_t *pool_a = NULL;
-server_t *server_a = NULL;
-server_t *server_b = NULL;
+#define if_err_return(rv, expr) if (((rv) = (expr)) != 0) return rv
+#define if_err_break(rv, expr)  if (((rv) = (expr)) != 0) break
+#define if_err(rv, expr)        if (((rv) = (expr)) != 0)
 
-static int main_parse_args(int argc, char **argv);
-static int main_init_globals(proxy_t **out_proxy);
-static int main_init_signals(proxy_t *proxy);
-static int main_spawn_workers(proxy_t *proxy);
-static int main_join_workers(proxy_t *proxy);
-static int main_listen_socket(proxy_t *proxy);
-static int main_deinit(proxy_t *proxy);
-static void *signal_main(void *arg);
+typedef struct _mysw_t mysw_t;
+typedef struct _buf_t buf_t;
+typedef struct _acceptor_t acceptor_t;
+typedef struct _worker_t worker_t;
+typedef struct _client_t client_t;
+typedef struct _backend_t backend_t;
+typedef struct _targeter_t targeter_t;
+typedef struct _mthread_t mthread_t;
+
+struct _mthread_t {
+    pthread_t thread;
+    int created;
+};
+
+struct _mysw_t {
+    worker_t *workers;
+    acceptor_t *acceptors;
+    client_t *clients;
+    backend_t *backends;
+    targeter_t *targeters;
+    mthread_t signal_thread;
+    int done_pipe[2];
+    int done;
+};
+
+struct _buf_t {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+};
+
+struct _acceptor_t {
+    int num;
+    pthread_t thread;
+    int thread_created;
+};
+
+struct _worker_t {
+    int num;
+    pthread_t thread;
+    int thread_created;
+    int epollfd;
+    aco_t *main_co;
+};
+
+struct _client_t {
+    int socketfd;
+    int eventfd;
+    int timerfd;
+    aco_t *co;
+    aco_share_stack_t *stack;
+};
+
+struct _backend_t {
+    int socketfd;
+    int eventfd;
+    int timerfd;
+    char *host;
+    int port;
+    char *dbname;
+    aco_t *co;
+    aco_share_stack_t *stack;
+};
+
+struct _targeter_t {
+    int num;
+    int eventfd;
+    pthread_t thread;
+    int thread_created;
+};
+
+static int create_signal_thread();
 static void signal_handle(int signum);
+static void signal_write_done();
+static void *signal_main(void *arg);
 static int signal_block_all();
 
-static int done_pipe[2];
+mysw_t mysw;
 
 int main(int argc, char **argv) {
-    proxy_t *proxy;
     int rv;
 
-    srand(time(NULL));
-
-    main_parse_args(argc, argv);
-
-    proxy = NULL;
-    do {
-        try_break(rv, main_init_globals(&proxy));
-        try_break(rv, main_init_signals(proxy));
-        try_break(rv, main_spawn_workers(proxy));
-        try_break(rv, main_listen_socket(proxy));
-    } while(0);
-
-    if (rv != 0 && proxy->fdpoll) proxy->fdpoll->done = 1;
-
-    main_join_workers(proxy);
-    main_deinit(proxy);
-
-    return rv == MYSW_OK ? 0 : 1;
-}
-
-static int main_parse_args(int argc, char **argv) {
-    /* TODO getopt */
     (void)argc;
     (void)argv;
-    return MYSW_OK;
+
+    memset(&mysw, 0, sizeof(mysw));
+    mysw.done_pipe[0] = -1;
+    mysw.done_pipe[1] = -1;
+    rv = 0;
+
+    do {
+        if_err_break(rv, create_signal_thread());
+        // if_err_break(rv, create_workers());
+        // if_err_break(rv, create_targeters());
+        // if_err_break(rv, create_clients());
+        // if_err_break(rv, create_backends());
+        // if_err_break(rv, create_listener());
+        // if_err_break(rv, create_acceptors());
+    } while (0);
+
+    // rv |= join_acceptor_threads();
+    // rv |= join_targeter_threads();
+    // rv |= join_worker_threads();
+    // rv |= join_signal_thread();
+
+    // free_acceptors();
+    // free_listener();
+    // free_backends();
+    // free_clients();
+    // free_targeters();
+    // free_workers();
+
+    return rv;
 }
 
-static int main_init_globals(proxy_t **out_proxy) {
-    proxy_t *proxy;
+static int create_signal_thread() {
     int rv;
-
-    /* Alloc proxy global */
-    proxy = calloc(1, sizeof(proxy_t));
-
-    /* Init event loop (epoll wrapper) */
-    try(rv, fdpoll_new(proxy, &proxy->fdpoll));
-
-    /* Alloc workers */
-    proxy->workers = calloc(opt_num_worker_threads, sizeof(worker_t));
-
-    /* Init targeter */
-    try(rv, targeter_new(proxy, &proxy->targeter));
-
-    /* Init spinlock */
-    if ((rv = pthread_spin_init(&proxy->spinlock_pool_map_val, PTHREAD_PROCESS_PRIVATE)) != 0) {
-        fprintf(stderr, "main_init_globals: pthread_spin_init: %s\n", strerror(rv));
-        return MYSW_ERR;
-    }
-    proxy->spinlock_pool_map = &proxy->spinlock_pool_map_val;
-
-    /* Init pools and servers */
-    /* TODO user configurable pools */
-    pool_new(proxy, "pool_a", &pool_a);
-    pool_fill(pool_a, "127.0.0.1", 3306, "test", 10);
-
-    /* Init targeter and targlets */
-    /* TODO user configurable targeters */
-
-    *out_proxy = proxy;
-    return MYSW_OK;
+    if_err_return(
+        rv,
+        pthread_create(&mysw.signal_thread.thread, NULL, signal_main, NULL)
+    );
+    mysw.signal_thread.created = 1;
+    if_err_return(rv, signal_block_all());
+    return 0;
 }
 
-static int main_init_signals(proxy_t *proxy) {
-    int rv;
-
-    /* Create signal handling thread */
-    if ((rv = pthread_create(&proxy->signal_thread_val, NULL, signal_main, proxy)) != 0) {
-        fprintf(stderr, "main_init_signals: pthread_create: %s\n", strerror(rv));
-        return MYSW_ERR;
-    }
-    proxy->signal_thread = &proxy->signal_thread_val;
-
-    /* For main thread and all subsequently spawned threads, block signals */
-    try(rv, signal_block_all());
-
-    return MYSW_OK;
+static void signal_handle(int signum) {
+    (void)signum;
+    signal_write_done();
 }
 
-static int main_spawn_workers(proxy_t *proxy) {
-    int rv, i;
-
-    /* Create worker threads */
-    for (i = 0; i < opt_num_worker_threads; ++i) {
-        try(rv, worker_init(&proxy->workers[i], proxy));
-        try(rv, worker_spawn(&proxy->workers[i]));
+static void signal_write_done() {
+    ssize_t rv;
+    int any;
+    if (mysw.done_pipe[1] >= 0) {
+        any = 1;
+        rv = write(mysw.done_pipe[1], &any, sizeof(any));
     }
-
-    return MYSW_OK;
-}
-
-static int main_join_workers(proxy_t *proxy) {
-    int i;
-
-    /* Join worker threads to main thread */
-    for (i = 0; i < opt_num_worker_threads; ++i) {
-        worker_join(&proxy->workers[i]);
-        worker_deinit(&proxy->workers[i]);
-    }
-
-    return MYSW_OK;
-}
-
-static int main_listen_socket(proxy_t *proxy) {
-    struct sockaddr_in addr;
-    int listenfd, optval;
-
-    /* Create listener socket */
-    proxy->fdo.socket_in.fd = -1;
-    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("main_listen_socket: socket");
-        return MYSW_ERR;
-    }
-    proxy->fdo.socket_in.fd = listenfd;
-
-    /* Set SO_REUSEPORT */
-    optval = 1;
-    if ((setsockopt(listenfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval))) < 0) {
-        perror("main_listen_socket: setsockopt");
-        return MYSW_ERR;
-    }
-
-    /* Bind to port */
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = opt_addr ? inet_addr(opt_addr) : INADDR_ANY;
-    addr.sin_port = htons(opt_port);
-    if (bind(listenfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("main_listen_socket: bind");
-        return MYSW_ERR;
-    }
-
-    /* Start listening */
-    if (listen(listenfd, opt_backlog) < 0) {
-        perror("main_listen_socket: listen");
-        return MYSW_ERR;
-    }
-
-    /* Add listener socket to event loop */
-    fdo_init(&proxy->fdo, proxy->fdpoll, proxy, NULL, NULL, listenfd, -1, -1, worker_accept_conn);
-    proxy->fdo.socket_in.read_write_skip = 1;
-    fdo_set_state(&proxy->fdo, 0, FDH_TYPE_SOCKET_IN);
-
-    return MYSW_OK;
+    (void)rv;
 }
 
 static void *signal_main(void *arg) {
-    int rv;
-    int signum;
+    int rv, ignore;
+    ssize_t readrv;
     fd_set rfds;
     struct timeval tv;
     struct sigaction sa;
-    proxy_t *proxy;
 
-    proxy = (proxy_t *)arg;
+    (void)arg;
 
-    /* Create done_pipe */
-    rv = pipe(done_pipe);
-    fcntl(done_pipe[1], F_SETFL, O_NONBLOCK);
+    // create done_pipe
+    if_err(rv, pipe(mysw.done_pipe)) {
+        perror("pipe");
+        mysw.done = 1;
+        return NULL;
+    }
+    if_err(rv, fcntl(mysw.done_pipe[1], F_SETFL, O_NONBLOCK)) {
+        perror("fcntl");
+        mysw.done = 1;
+        return NULL;
+    }
 
-    /* Install signal handler */
+    // install signal handler
     memset(&sa, 0, sizeof(struct sigaction));
     sa.sa_handler = signal_handle;
     sigaction(SIGINT, &sa, NULL);
@@ -196,59 +183,30 @@ static void *signal_main(void *arg) {
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
 
-    /* Wait for write on done_pipe from signal_handle */
+    // wait for write on done_pipe from signal_write_done
     do {
         FD_ZERO(&rfds);
-        FD_SET(done_pipe[0], &rfds);
-        tv.tv_sec = 60;
+        FD_SET(mysw.done_pipe[0], &rfds);
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
-        rv = select(done_pipe[0] + 1, &rfds, NULL, NULL, &tv);
+        rv = select(mysw.done_pipe[0] + 1, &rfds, NULL, NULL, &tv);
     } while (rv < 1);
 
-    /* Read pipe for fun */
-    rv = read(done_pipe[0], &signum, sizeof(int));
+    // read pipe for fun
+    readrv = read(mysw.done_pipe[0], &ignore, sizeof(int));
+    (void)readrv;
 
-    /* End event loop */
-    proxy->fdpoll->done = 1;
-    /* TODO broadcast all conditions */
+    // set done flag
+    mysw.done = 1;
+    // TODO wakeup threads waiting on condition
 
     return NULL;
 }
 
-static void signal_handle(int signum) {
-    write(done_pipe[1], &signum, sizeof(int));
-}
-
 static int signal_block_all() {
+    int rv;
     sigset_t set;
-    sigfillset(&set);
-    if (sigprocmask(SIG_BLOCK, &set, NULL) == 0) {
-        perror("signal_block_all: sigprocmask");
-        return MYSW_OK;
-    }
-    return MYSW_ERR;
-}
-
-static int main_deinit(proxy_t *proxy) {
-
-    server_destroy(server_a);
-    server_destroy(server_b);
-    pool_destroy(pool_a);
-
-
-    if (proxy->signal_thread) {
-        signal_handle(0);
-        pthread_join(*proxy->signal_thread, NULL);
-    }
-    if (proxy->fdo.socket_in.fd != -1) {
-        close(proxy->fdo.socket_in.fd);
-        fdo_deinit(&proxy->fdo);
-    }
-    if (proxy->fdpoll) fdpoll_free(proxy->fdpoll);
-    if (proxy->workers) free(proxy->workers);
-    /* TODO if (proxy->pool_map) pool_free_all(proxy); */
-    /* if (proxy->targeter) targeter_free(proxy->targeter); */
-    if (proxy->spinlock_pool_map) pthread_spin_destroy(proxy->spinlock_pool_map);
-    free(proxy);
-    return MYSW_OK;
+    if_err_return(rv, sigfillset(&set));
+    if_err_return(rv, sigprocmask(SIG_BLOCK, &set, NULL));
+    return 0;
 }

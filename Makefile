@@ -1,19 +1,18 @@
-prefix?=/usr/local
-
-mysw_cflags:=-std=c90 -Wall -Wextra -pedantic -fstack-protector-all -g -O0 -D_GNU_SOURCE -I. $(CFLAGS)
-mysw_ldflags:=$(LDFLAGS)
-mysw_ldlibs:=-lm -lpthread -lcrypto $(LDLIBS)
-mysw_objects:=$(patsubst %.c,%.o,$(wildcard *.c))
+mysw_cflags:=-std=c99 -Wall -Wextra -pedantic -Ivendor/libaco -g -O0 -D_GNU_SOURCE $(CFLAGS)
+mysw_libs:=-pthread -lm $(LDLIBS)
 
 all: mysw
 
-mysw: $(mysw_objects)
-	$(CC) $(mysw_cflags) $(mysw_objects) $(mysw_ldflags) $(mysw_ldlibs) -o mysw
+aco.o: vendor/libaco/aco.c
+	$(CC) -c $< -o $@
 
-$(mysw_objects): %.o: %.c
-	$(CC) -c $(mysw_cflags) $< -o $@
+acosw.o: vendor/libaco/acosw.S
+	$(CC) -c $< -o $@
+
+mysw: mysw.c aco.o acosw.o
+	$(CC) $(mysw_cflags) mysw.c aco.o acosw.o -o mysw $(mysw_libs)
 
 clean:
-	rm -f mysw $(mysw_objects)
+	rm -f mysw aco.o acosw.o
 
 .PHONY: all clean

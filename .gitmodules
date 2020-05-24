@@ -1,0 +1,3 @@
+[submodule "vendor/libaco"]
+	path = vendor/libaco
+	url = https://github.com/hnes/libaco.git
