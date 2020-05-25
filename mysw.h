@@ -9,7 +9,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
 #include "aco.h"
 
 #define if_err_return(rv, expr) if (((rv) = (expr)) != 0) return rv
@@ -21,18 +27,25 @@
 #define MYSW_FDO_TYPE_CLIENT  1
 #define MYSW_FDO_TYPE_BACKEND 2
 
-typedef struct _mysw_t     mysw_t;
-typedef struct _buf_t      buf_t;
 typedef struct _acceptor_t acceptor_t;
-typedef struct _worker_t   worker_t;
-typedef struct _client_t   client_t;
 typedef struct _backend_t  backend_t;
-typedef struct _targeter_t targeter_t;
-typedef struct _mthread_t  mthread_t;
+typedef struct _buf_t      buf_t;
+typedef struct _client_t   client_t;
 typedef struct _fdo_t      fdo_t;
+typedef struct _fdh_t      fdh_t;
+typedef struct _mlock_t    mlock_t;
+typedef struct _mthread_t  mthread_t;
+typedef struct _mysw_t     mysw_t;
+typedef struct _targeter_t targeter_t;
+typedef struct _worker_t   worker_t;
 
 struct _mthread_t {
     pthread_t thread;
+    int created;
+};
+
+struct _mlock_t {
+    pthread_spinlock_t spinlock;
     int created;
 };
 
@@ -42,21 +55,38 @@ struct _fdo_t {
         client_t *client;
         backend_t *backend;
     } owner;
-    struct epoll_event *last_event;
+    struct epoll_event *event;
     aco_t *co;
     aco_share_stack_t *stack;
     int co_dead;
 };
 
+struct _fdh_t {
+    fdo_t *fdo;
+    int fd;
+};
+
 struct _mysw_t {
+    char *opt_addr;
+    int opt_port;
+    int opt_backlog;
     int opt_num_workers;
+    int opt_num_acceptors;
     int opt_num_epoll_events;
+    int opt_max_num_clients;
+    int opt_worker_epoll_timeout_ms;
+    int opt_acceptor_select_timeout_s;
     worker_t *workers;
     acceptor_t *acceptors;
-    client_t *clients;
     backend_t *backends;
     targeter_t *targeters;
     mthread_t signal_thread;
+
+    client_t *clients;
+    client_t *clients_unused;
+    mlock_t clients_lock;
+
+    int listenfd;
     int done_pipe[2];
     int done;
 };
@@ -69,8 +99,7 @@ struct _buf_t {
 
 struct _acceptor_t {
     int num;
-    pthread_t thread;
-    int thread_created;
+    mthread_t thread;
 };
 
 struct _worker_t {
@@ -82,25 +111,28 @@ struct _worker_t {
 };
 
 struct _client_t {
-    int socketfd;
-    int eventfd;
-    int timerfd;
+    int num;
+    worker_t *worker;
     fdo_t fdo;
+    fdh_t fdh_socket;
+    fdh_t fdh_event;
+    fdh_t fdh_timer;
+    client_t *next_unused;
 };
 
 struct _backend_t {
-    int socketfd;
-    int eventfd;
-    int timerfd;
-    fdo_t fdo;
     char *host;
     int port;
     char *dbname;
+    fdo_t fdo;
+    fdh_t fdh_socket;
+    fdh_t fdh_event;
+    fdh_t fdh_timer;
 };
 
 struct _targeter_t {
     int num;
-    int eventfd;
+    fdh_t eventfdh;
     pthread_t thread;
     int thread_created;
 };
@@ -108,6 +140,7 @@ struct _targeter_t {
 void *signal_main(void *arg);
 int signal_block_all();
 void *worker_main(void *arg);
+void *acceptor_main(void *arg);
 void client_handle();
 void backend_handle();
 

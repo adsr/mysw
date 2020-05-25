@@ -1,11 +1,11 @@
 #include "mysw.h"
 
-static int worker_resume_fdo(fdo_t *fdo, worker_t *worker);
+static int worker_resume_fdh(fdh_t *fdh, worker_t *worker);
 
 void *worker_main(void *arg) {
     worker_t *worker;
     struct epoll_event *event;
-    fdo_t *fdo;
+    fdh_t *fdh;
     int nfds, i;
 
     worker = (worker_t*)arg;
@@ -19,7 +19,7 @@ void *worker_main(void *arg) {
     while (!mysw.done) {
 
         // wait on fds
-        nfds = epoll_wait(worker->epollfd, worker->events, mysw.opt_num_epoll_events, 1000);
+        nfds = epoll_wait(worker->epollfd, worker->events, mysw.opt_num_epoll_events, mysw.opt_worker_epoll_timeout_ms);
         if (nfds < 0) {
             // epoll error
             if (errno == EINTR) continue;
@@ -33,9 +33,9 @@ void *worker_main(void *arg) {
         // process owner of each event
         for (i = 0; i < nfds; ++i) {
             event = worker->events + i;
-            fdo = (fdo_t*)event->data.ptr;
-            fdo->last_event = event;
-            worker_resume_fdo(fdo, worker);
+            fdh = (fdh_t*)event->data.ptr;
+            fdh->fdo->event = event;
+            worker_resume_fdh(fdh, worker);
         }
     }
 
@@ -45,9 +45,12 @@ void *worker_main(void *arg) {
     return NULL;
 }
 
-static int worker_resume_fdo(fdo_t *fdo, worker_t *worker) {
+static int worker_resume_fdh(fdh_t *fdh, worker_t *worker) {
     void (*co_func)();
     void *co_arg;
+    fdo_t *fdo;
+
+    fdo = fdh->fdo;
 
     switch (fdo->type) {
         case MYSW_FDO_TYPE_CLIENT:
@@ -59,7 +62,7 @@ static int worker_resume_fdo(fdo_t *fdo, worker_t *worker) {
             co_arg = fdo->owner.backend;
             break;
         default:
-            fprintf(stderr, "worker_resume_fdo: Unrecognized fdo type %d\n", fdo->type);
+            fprintf(stderr, "worker_resume_fdh: Unrecognized fdo type %d\n", fdo->type);
             return MYSW_ERR;
     }
 
@@ -80,6 +83,7 @@ static int worker_resume_fdo(fdo_t *fdo, worker_t *worker) {
         aco_share_stack_destroy(fdo->stack);
         fdo->co = NULL;
         fdo->stack = NULL;
+        fdo->co_dead = 0;
     }
 
     return MYSW_OK;
