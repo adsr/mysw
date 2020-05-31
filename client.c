@@ -9,6 +9,7 @@ static int client_handle_result(client_t *client);
 static int client_yield_write_buf(client_t *client);
 static int client_yield_read_packet(client_t *client);
 static int client_yield_write_ok(client_t *client);
+static int client_deinit(client_t *client);
 
 int client_create_all() {
     int rv, i;
@@ -88,6 +89,7 @@ int client_create_all() {
 int client_free_all() {
     int i;
     client_t *client;
+    fdo_t *fdo;
 
     // bail if not allocated
     if (!mysw.clients) {
@@ -102,18 +104,26 @@ int client_free_all() {
     // free each client
     for (i = 0; i < mysw.opt_max_num_clients; ++i) {
         client = mysw.clients + i;
-        if (client->fdh_socket.fd >= 0) {
-            epoll_ctl(client->worker->epollfd, EPOLL_CTL_DEL, client->fdh_socket.fd, NULL);
-            close(client->fdh_socket.fd);
-        }
+
+        // deinit (closes socket)
+        client_deinit(client);
+
+        // close eventfd
         if (client->fdh_event.fd >= 0) {
             epoll_ctl(client->worker->epollfd, EPOLL_CTL_DEL, client->fdh_event.fd, NULL);
             close(client->fdh_event.fd);
         }
+
+        // close timerfd
         if (client->fdh_timer.fd >= 0) {
             epoll_ctl(client->worker->epollfd, EPOLL_CTL_DEL, client->fdh_timer.fd, NULL);
             close(client->fdh_timer.fd);
         }
+
+        // free coroutine resources
+        fdo = &client->fdo;
+        if (fdo->co) aco_destroy(fdo->co);
+        if (fdo->co_stack) aco_share_stack_destroy(fdo->co_stack);
     }
 
     free(mysw.clients);
@@ -148,20 +158,19 @@ static void client_handle() {
         }
 
         // TODO check timeout
+        // TODO check hangup
+        // TODO reset client
 
         // process client
         switch (client->state) {
             case MYSW_STATE_CLIENT_IS_CONNECTING:  client_handle_connect(client); break;
             case MYSW_STATE_CLIENT_IS_SENDING_CMD: client_handle_command(client); break;
             case MYSW_STATE_CLIENT_IS_RECVING_RES: client_handle_result(client);  break;
-            default: fprintf(stderr, "client_handle: Unrecognized client state %d\n", client->state); break;
+            default:
+                fprintf(stderr, "client_handle: Unrecognized client state %d\n", client->state);
+                client_deinit(client);
+                break;
         }
-
-        // TODO check timeout
-
-        // TODO check hangup
-
-        // TODO reset client
 
         aco_yield();
     }
@@ -409,3 +418,44 @@ static int client_yield_write_ok(client_t *client) {
     return client_yield_write_buf(client);
 }
 
+static int client_deinit(client_t *client) {
+    struct itimerspec its;
+    uint64_t u64;
+
+    // close socket if needed
+    if (client->fdh_socket.fd >= 0) {
+        epoll_ctl(client->worker->epollfd, EPOLL_CTL_DEL, client->fdh_socket.fd, NULL);
+        close(client->fdh_socket.fd);
+        client->fdh_socket.fd = -1;
+    }
+
+    // disarm timerfd
+    memset(&its, 0, sizeof(its));
+    timerfd_settime(client->fdh_timer.fd, 0, &its, NULL);
+
+    // drain eventfd (should return EAGAIN if no events)
+    read(client->fdh_event.fd, &u64, sizeof(u64));
+
+    // reset scalars
+    client->state = 0;
+    client->last_sequence_id = 0;
+    client->status_flags = 0;
+
+    // reset buffers
+    buf_clear(&client->wbuf);
+    buf_clear(&client->rbuf);
+    buf_clear(&client->username);
+    buf_clear(&client->db_name);
+    buf_clear(&client->hint);
+    buf_clear(&client->hint);
+
+    // deinit cmd
+    cmd_deinit(&client->cmd);
+
+    // clear coroutine stack
+    if (client->fdo.co_stack) {
+        memset(client->fdo.co_stack->ptr, 0, client->fdo.co_stack->sz);
+    }
+
+    return MYSW_OK;
+}

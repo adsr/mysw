@@ -106,6 +106,9 @@ static void *acceptor_main(void *arg) {
             continue;
         }
 
+        // set client state
+        client->state = MYSW_STATE_CLIENT_IS_CONNECTING;
+
         // write to client eventfd
         if (write(client->fdh_event.fd, &u64, sizeof(u64)) != sizeof(u64)) {
             perror("acceptor_main: write");

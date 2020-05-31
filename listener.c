@@ -3,10 +3,21 @@
 int listener_create() {
     struct sockaddr_in addr;
     int optval;
+    int flags;
 
     // create socket
     if ((mysw.listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("create_listener: socket");
+        return MYSW_ERR;
+    }
+
+    // make socket non-blocking
+    if ((flags = fcntl(mysw.listenfd, F_GETFL, 0)) < 0) {
+        perror("create_listener: fcntl F_GETFL");
+        return MYSW_ERR;
+    }
+    if (fcntl(mysw.listenfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        perror("create_listener: fcntl F_SETFL");
         return MYSW_ERR;
     }
 

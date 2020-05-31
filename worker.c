@@ -120,7 +120,7 @@ static void *worker_main(void *arg) {
     // destroy main coroutine
     aco_destroy(worker->main_co);
 
-    return MYSW_OK;
+    return NULL;
 }
 
 static int worker_run_co(fdh_t *fdh, worker_t *worker) {
@@ -128,23 +128,15 @@ static int worker_run_co(fdh_t *fdh, worker_t *worker) {
 
     fdo = fdh->fdo;
 
-    // allocate or clear coroutine
-    // TODO preallocate
+    // allocate coroutine if needed
     // TODO libaco errors
     if (!fdo->co) {
         fdo->co_stack = aco_share_stack_new(0);
         fdo->co = aco_create(worker->main_co, fdo->co_stack, 0, fdo->co_func, fdo->co_arg);
-    } else {
-        memset(fdo->co_stack->ptr, 0, fdo->co_stack->sz);
-        fdo->co->fp = fdo->co_func;
-        fdo->co->arg = fdo->co_arg;
     }
 
     // resume co
     aco_resume(fdo->co);
-
-    // TODO aco_destroy(fdo->co);
-    // TODO aco_share_stack_destroy(fdo->co_stack);
 
     return MYSW_OK;
 }

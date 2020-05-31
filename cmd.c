@@ -241,5 +241,6 @@ int cmd_deinit(cmd_t *cmd) {
         LL_DELETE(cmd->stmt_list, stmt);
         free(stmt);
     }
+    memset(cmd, 0, sizeof(cmd_t));
     return MYSW_OK;
 }
