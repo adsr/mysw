@@ -1,17 +1,95 @@
 #include "mysw.h"
 
-static int worker_resume_fdh(fdh_t *fdh, worker_t *worker);
+static int worker_run_co(fdh_t *fdh, worker_t *worker);
+static void *worker_main(void *arg);
 
-void *worker_main(void *arg) {
+int worker_create_all() {
+    int rv, i;
+    worker_t *worker;
+
+    // allocate workers
+    mysw.workers = calloc(mysw.opt_num_workers, sizeof(worker_t));
+    if (!mysw.workers) {
+        perror("create_workers: calloc");
+        return MYSW_ERR;
+    }
+
+    // init fds to -1
+    for (i = 0; i < mysw.opt_num_workers; ++i) {
+        worker = mysw.workers + i;
+        worker->epollfd = -1;
+    }
+
+    // init each worker
+    for (i = 0; i < mysw.opt_num_workers; ++i) {
+        worker = mysw.workers + i;
+        worker->num = i;
+        worker->epollfd = epoll_create(1);
+        if (worker->epollfd < 0) {
+            perror("create_workers: epoll_create");
+            return MYSW_ERR;
+        }
+        worker->events = calloc(mysw.opt_num_epoll_events, sizeof(struct epoll_event));
+        if (!worker->events) {
+            perror("create_workers: calloc");
+            return MYSW_ERR;
+        }
+        if_err_return(rv, pthread_create(&worker->thread.thread, NULL, worker_main, worker));
+        worker->thread.created = 1;
+    }
+
+    return MYSW_OK;
+}
+
+int worker_join_all() {
+    int rv, i;
+    worker_t *worker;
+
+    // join worker threads
+    for (i = 0; i < mysw.opt_num_workers; ++i) {
+        worker = mysw.workers + i;
+        if (worker->thread.created) {
+            if_err_return(rv, pthread_join(worker->thread.thread, NULL));
+        }
+    }
+
+    return MYSW_OK;
+}
+
+int worker_free_all() {
+    int i;
+    worker_t *worker;
+
+    // bail if not allocated
+    if (!mysw.workers) {
+        return MYSW_OK;
+    }
+
+    // free each worker
+    for (i = 0; i < mysw.opt_num_workers; ++i) {
+        worker = mysw.workers + i;
+        if (worker->epollfd >= 0) {
+            close(worker->epollfd);
+        }
+        if (worker->events) {
+            free(worker->events);
+        }
+    }
+
+    free(mysw.workers);
+
+    return MYSW_OK;
+}
+
+static void *worker_main(void *arg) {
+    int nfds, i;
     worker_t *worker;
     struct epoll_event *event;
     fdh_t *fdh;
-    int nfds, i;
 
     worker = (worker_t*)arg;
 
     // create main coroutine
-    // TODO libaco errors
     aco_thread_init(NULL);
     worker->main_co = aco_create(NULL, NULL, 0, NULL, NULL);
 
@@ -30,61 +108,44 @@ void *worker_main(void *arg) {
             continue;
         }
 
-        // process owner of each event
+        // process events
         for (i = 0; i < nfds; ++i) {
             event = worker->events + i;
             fdh = (fdh_t*)event->data.ptr;
             fdh->fdo->event = event;
-            worker_resume_fdh(fdh, worker);
+            worker_run_co(fdh, worker);
         }
     }
 
-    // destroy main co
+    // destroy main coroutine
     aco_destroy(worker->main_co);
 
-    return NULL;
+    return MYSW_OK;
 }
 
-static int worker_resume_fdh(fdh_t *fdh, worker_t *worker) {
-    void (*co_func)();
-    void *co_arg;
+static int worker_run_co(fdh_t *fdh, worker_t *worker) {
     fdo_t *fdo;
 
     fdo = fdh->fdo;
 
-    switch (fdo->type) {
-        case MYSW_FDO_TYPE_CLIENT:
-            co_func = client_handle;
-            co_arg = fdo->owner.client;
-            break;
-        case MYSW_FDO_TYPE_BACKEND:
-            co_func = backend_handle;
-            co_arg = fdo->owner.backend;
-            break;
-        default:
-            fprintf(stderr, "worker_resume_fdh: Unrecognized fdo type %d\n", fdo->type);
-            return MYSW_ERR;
-    }
-
-    // allocate co if needed
-    // TODO preallocate, needs aco_reset
+    // allocate or clear coroutine
+    // TODO preallocate
     // TODO libaco errors
     if (!fdo->co) {
-        fdo->stack = aco_share_stack_new(0);
-        fdo->co = aco_create(worker->main_co, fdo->stack, 0, co_func, co_arg);
+        fdo->co_stack = aco_share_stack_new(0);
+        fdo->co = aco_create(worker->main_co, fdo->co_stack, 0, fdo->co_func, fdo->co_arg);
+    } else {
+        memset(fdo->co_stack->ptr, 0, fdo->co_stack->sz);
+        fdo->co->fp = fdo->co_func;
+        fdo->co->arg = fdo->co_arg;
     }
 
     // resume co
     aco_resume(fdo->co);
 
-    // destroy co if dead
-    if (fdo->co_dead) {
-        aco_destroy(fdo->co);
-        aco_share_stack_destroy(fdo->stack);
-        fdo->co = NULL;
-        fdo->stack = NULL;
-        fdo->co_dead = 0;
-    }
+    // TODO aco_destroy(fdo->co);
+    // TODO aco_share_stack_destroy(fdo->co_stack);
 
     return MYSW_OK;
 }
+

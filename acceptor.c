@@ -1,6 +1,56 @@
 #include "mysw.h"
 
-void *acceptor_main(void *arg) {
+static void *acceptor_main(void *arg);
+
+int acceptor_create_all() {
+    int rv, i;
+    acceptor_t *acceptor;
+
+    // allocate acceptors
+    mysw.acceptors = calloc(mysw.opt_num_acceptors, sizeof(acceptor_t));
+    if (!mysw.acceptors) {
+        perror("create_acceptors: calloc");
+        return MYSW_ERR;
+    }
+
+    // create acceptor threads
+    for (i = 0; i < mysw.opt_num_acceptors; ++i) {
+        acceptor = mysw.acceptors + i;
+        acceptor->num = i;
+        if_err_return(rv, pthread_create(&acceptor->thread.thread, NULL, acceptor_main, acceptor));
+        acceptor->thread.created = 1;
+    }
+
+    return MYSW_OK;
+}
+
+int acceptor_join_all() {
+    int rv, i;
+    acceptor_t *acceptor;
+
+    // join acceptor threads
+    for (i = 0; i < mysw.opt_num_acceptors; ++i) {
+        acceptor = mysw.acceptors + i;
+        if (acceptor->thread.created) {
+            if_err_return(rv, pthread_join(acceptor->thread.thread, NULL));
+        }
+    }
+
+    return MYSW_OK;
+}
+
+int acceptor_free_all() {
+    // bail if not allocated
+    if (!mysw.acceptors) {
+        return MYSW_OK;
+    }
+
+    free(mysw.acceptors);
+
+    return MYSW_OK;
+}
+
+static void *acceptor_main(void *arg) {
     int rv, socketfd;
     fd_set rfds;
     struct timeval timeout;

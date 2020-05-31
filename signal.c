@@ -1,9 +1,36 @@
 #include "mysw.h"
 
+static void *signal_main(void *arg);
+static int signal_block_all();
 static void signal_handle(int signum);
 static void signal_write_done();
 
-void *signal_main(void *arg) {
+int signal_create_thread() {
+    int rv;
+
+    // create signal thread
+    if_err_return(rv, pthread_create(&mysw.signal_thread.thread, NULL, signal_main, NULL));
+    mysw.signal_thread.created = 1;
+
+    // block all signals for all other threads
+    if_err_return(rv, signal_block_all());
+
+    return MYSW_OK;
+}
+
+int signal_join_thread() {
+    int rv;
+
+    // join signal thread
+    if (mysw.signal_thread.created) {
+        if_err_return(rv, pthread_join(mysw.signal_thread.thread, NULL));
+    }
+
+    return MYSW_OK;
+}
+
+
+static void *signal_main(void *arg) {
     int rv, ignore;
     ssize_t iorv;
     fd_set rfds;
@@ -53,7 +80,7 @@ void *signal_main(void *arg) {
     return NULL;
 }
 
-int signal_block_all() {
+static int signal_block_all() {
     int rv;
     sigset_t set;
     if_err_return(rv, sigfillset(&set));
