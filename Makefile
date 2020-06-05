@@ -1,6 +1,6 @@
-mysw_cflags:=-std=c99 -Wall -Wextra -pedantic -Ivendor/libaco -g -O0 -D_GNU_SOURCE $(CFLAGS)
+mysw_cflags:=-std=c99 -Wall -Wextra -pedantic -Ivendor/libaco -Ivendor/uthash/src -g -O0 -D_GNU_SOURCE $(CFLAGS)
 mysw_libs:=-pthread -lm $(LDLIBS)
-mysw_sources:=mysw.c signal.c worker.c client.c backend.c acceptor.c listener.c buf.c cmd.c
+mysw_sources:=mysw.c signal.c worker.c client.c server.c acceptor.c listener.c buf.c targeter.c util.c
 
 all: mysw
 

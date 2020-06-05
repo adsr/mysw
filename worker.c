@@ -128,6 +128,11 @@ static int worker_run_co(fdh_t *fdh, worker_t *worker) {
 
     fdo = fdh->fdo;
 
+    if (!*fdo->alive) {
+        fprintf(stderr, "worker_run_co: Tried to run coroutine for dead fdo\n");
+        return MYSW_OK;
+    }
+
     // allocate coroutine if needed
     // TODO libaco errors
     if (!fdo->co) {
@@ -138,6 +143,10 @@ static int worker_run_co(fdh_t *fdh, worker_t *worker) {
     // resume co
     aco_resume(fdo->co);
 
+    // clear co stack if object no longer alive
+    if (!*fdo->alive) {
+        memset(fdo->co_stack->ptr, 0, fdo->co_stack->sz);
+    }
+
     return MYSW_OK;
 }
-

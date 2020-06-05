@@ -153,6 +153,10 @@ int buf_len(buf_t *buf) {
     return buf->len;
 }
 
+int buf_empty(buf_t *buf) {
+    return buf->len < 1 ? 1 : 0;
+}
+
 int buf_set_u24(buf_t *buf, size_t pos, uint32_t i) {
     return buf_set_void(buf, pos, &i, 3);
 }
